@@ -31,8 +31,12 @@ class RouterConfig:
     history_cost: float = 5.0
     max_expansions: int = 250_000
     layer: str | None = None
-    use_routing_guides: bool = True
+    use_routing_guides: bool = False
     guide_cost: float = 0.8
+    hard_avoidance: bool = True
+    max_shove_blockers: int = 4
+    short_routes_first: bool = True
+    strict_final: bool = True
 
     def validate(self) -> None:
         if not math.isfinite(self.grid_step) or self.grid_step <= 0:
@@ -45,6 +49,8 @@ class RouterConfig:
             raise ValueError("Routing margins cannot be negative.")
         if self.max_expansions <= 0:
             raise ValueError("Maximum A* expansions must be positive.")
+        if self.max_shove_blockers < 0:
+            raise ValueError("Maximum shove blockers cannot be negative.")
         for label, value in (("bend penalty", self.bend_penalty),
                              ("present congestion cost", self.present_congestion_cost),
                              ("history cost", self.history_cost),
@@ -97,10 +103,11 @@ def extract_jobs(data: dict, layer: str | None = None) -> list[RoutingJob]:
     """Read route requests without using archived paths as routing geometry.
 
     The supplied testcase stores its unrouted two-terminal connections under
-    ``deleted_connections.wires``.  Endpoints, net, width and layer define the
-    request; the interior polyline is retained only as a guide and is heavily
-    coarsened before routing.  A generic producer can instead emit
-    ``routing_connections`` records with ``start`` and ``end`` pairs.
+    ``deleted_connections.wires``.  Only endpoints, net, width and layer define
+    the request; archived interior points are intentionally ignored so a
+    reference route cannot leak into the result.  A generic producer can emit
+    ``routing_connections`` records with ``start``/``end`` and an optional,
+    explicitly authored ``guide``.
     """
     default_layer = layer or data.get("layer")
     records = data.get("routing_connections")
@@ -135,7 +142,7 @@ def extract_jobs(data: dict, layer: str | None = None) -> list[RoutingJob]:
         width = _number(record.get("width"), 2.0)
         if width <= 0:
             continue
-        raw_guide = points if archived else record.get("guide", [])
+        raw_guide = [] if archived else record.get("guide", [])
         guide = ()
         if isinstance(raw_guide, list) and len(raw_guide) >= 2:
             try:
@@ -174,6 +181,8 @@ class Autorouter:
         self.static: dict[int, set[str | None]] = {}
         self.usage: dict[int, set[int]] = {}
         self.footprints: dict[int, set[int]] = {}
+        self.diagonal_usage: dict[Cell, dict[int, int]] = {}
+        self.diagonal_footprints: dict[int, set[Cell]] = {}
         self.routes: dict[int, list[Cell]] = {}
         self.history: dict[int, int] = {}
         self.jobs_by_id = {job.id: job for job in self.jobs}
@@ -350,7 +359,7 @@ class Autorouter:
                     return False
         return True
 
-    def _dynamic_cost(self, cell: Cell, job: RoutingJob, present_factor: float) -> float:
+    def _dynamic_context(self, cell: Cell, job: RoutingJob) -> tuple[set[int], int]:
         conflicts: set[int] = set()
         historical = 0
         search_radius = job.width / 2 + self.clearance + self.max_half_width
@@ -368,7 +377,33 @@ class Autorouter:
                         (x - ox) ** 2 + (y - oy) ** 2 < (required - 1e-7) ** 2):
                     conflicts.add(other_id)
             historical += self.history.get(key, 0)
-        return present_factor * len(conflicts) + self.config.history_cost * historical
+        return conflicts, historical
+
+    def _dynamic_cost_parts(self, cell: Cell, job: RoutingJob) -> tuple[int, int]:
+        conflicts, historical = self._dynamic_context(cell, job)
+        return len(conflicts), historical
+
+    @staticmethod
+    def _diagonal_square(a: Cell, b: Cell) -> tuple[Cell, int] | None:
+        if abs(a[0] - b[0]) != 1 or abs(a[1] - b[1]) != 1:
+            return None
+        square = min(a[0], b[0]), min(a[1], b[1])
+        orientation = 1 if (b[0] - a[0]) * (b[1] - a[1]) > 0 else -1
+        return square, orientation
+
+    def _diagonal_blockers(self, a: Cell, b: Cell, job: RoutingJob) -> set[int]:
+        diagonal = self._diagonal_square(a, b)
+        if diagonal is None:
+            return set()
+        square, orientation = diagonal
+        return {other_id for other_id, other_orientation in
+                self.diagonal_usage.get(square, {}).items()
+                if other_orientation != orientation and
+                self.jobs_by_id[other_id].net != job.net}
+
+    def _dynamic_cost(self, cell: Cell, job: RoutingJob, present_factor: float) -> float:
+        conflicts, historical = self._dynamic_cost_parts(cell, job)
+        return present_factor * conflicts + self.config.history_cost * historical
 
     def _guide_bounds(self, job: RoutingJob, margin: float) -> tuple[int, int, int, int]:
         guide = job.guide if self.config.use_routing_guides and job.guide else (job.start, job.goal)
@@ -385,7 +420,7 @@ class Autorouter:
         return max(dx, dy) + (math.sqrt(2) - 1) * min(dx, dy)
 
     def _astar(self, job: RoutingJob, bounds: tuple[int, int, int, int],
-               present_factor: float) -> list[Cell] | None:
+               present_factor: float, hard_avoidance: bool = False) -> list[Cell] | None:
         start, goal = self._cell(job.start), self._cell(job.goal)
         if start == goal:
             return [start]
@@ -395,7 +430,7 @@ class Autorouter:
         incoming = {start: -1}
         previous: dict[Cell, Cell] = {}
         legal_cache: dict[Cell, bool] = {}
-        dynamic_cache: dict[Cell, float] = {}
+        dynamic_cache: dict[Cell, tuple[int, int]] = {}
         guide_cache: dict[Cell, float] = {}
         queue = [(self._heuristic(start, goal), next(counter), 0.0, start, -1)]
         expansions = 0
@@ -422,10 +457,15 @@ class Autorouter:
                     continue
                 move = math.sqrt(2) if dx and dy else 1.0
                 bend = self.config.bend_penalty if old_direction >= 0 and old_direction != direction else 0.0
-                dynamic = dynamic_cache.get(nxt)
-                if dynamic is None:
-                    dynamic = self._dynamic_cost(nxt, job, present_factor)
-                    dynamic_cache[nxt] = dynamic
+                dynamic_parts = dynamic_cache.get(nxt)
+                if dynamic_parts is None:
+                    dynamic_parts = self._dynamic_cost_parts(nxt, job)
+                    dynamic_cache[nxt] = dynamic_parts
+                conflicts, historical = dynamic_parts
+                conflicts += len(self._diagonal_blockers(cell, nxt, job))
+                if hard_avoidance and conflicts:
+                    continue
+                dynamic = present_factor * conflicts + self.config.history_cost * historical
                 guide_cost = guide_cache.get(nxt)
                 if guide_cost is None:
                     guide_cost = self._routing_guide_cost(nxt, job)
@@ -507,6 +547,8 @@ class Autorouter:
                 return None
             if self._dynamic_cost(cell, job, present_factor):
                 return None
+            if index and self._diagonal_blockers(path[index - 1], cell, job):
+                return None
         return path
 
     def _pattern_paths(self, job: RoutingJob) -> Iterable[list[Cell]]:
@@ -546,16 +588,21 @@ class Autorouter:
                 old_direction = direction
                 cost += (math.sqrt(2) if direction[0] and direction[1] else 1.0)
                 cost += self._dynamic_cost(cell, job, self.config.present_congestion_cost)
+                cost += self.config.present_congestion_cost * len(
+                    self._diagonal_blockers(previous, cell, job))
             if valid and cost < best_cost:
                 best_path, best_cost = path, cost
         return best_path
 
-    def _route_job(self, job: RoutingJob, present_factor: float) -> list[Cell] | None:
+    def _route_job(self, job: RoutingJob, present_factor: float,
+                   hard_avoidance: bool = False) -> list[Cell] | None:
         guided = self._guided_pattern(job, present_factor)
         if guided is not None:
             return guided
         pattern = self._pattern_route(job) if not (self.config.use_routing_guides and job.guide) else None
-        if pattern is not None and not any(self._dynamic_cost(cell, job, present_factor) for cell in pattern):
+        if (pattern is not None and
+                not any(self._dynamic_cost(cell, job, present_factor) for cell in pattern) and
+                not any(self._diagonal_blockers(a, b, job) for a, b in zip(pattern, pattern[1:]))):
             return pattern
         # Increasing guide boxes mimic detailed-route guide relaxation.
         margins = [self.config.guide_margin,
@@ -567,19 +614,27 @@ class Autorouter:
             if bounds in tried:
                 continue
             tried.add(bounds)
-            route = self._astar(job, bounds, present_factor)
+            route = self._astar(job, bounds, present_factor, hard_avoidance)
             if route is not None:
                 return route
         return None
 
     def _commit(self, job: RoutingJob, path: list[Cell]) -> None:
         footprint = set()
+        diagonals = set()
         for cell in path:
             key = self._key(cell)
             self.usage.setdefault(key, set()).add(job.id)
             footprint.add(key)
+        for a, b in zip(path, path[1:]):
+            diagonal = self._diagonal_square(a, b)
+            if diagonal is not None:
+                square, orientation = diagonal
+                self.diagonal_usage.setdefault(square, {})[job.id] = orientation
+                diagonals.add(square)
         self.routes[job.id] = path
         self.footprints[job.id] = footprint
+        self.diagonal_footprints[job.id] = diagonals
 
     def _remove(self, job_id: int) -> None:
         for key in self.footprints.pop(job_id, ()):
@@ -589,11 +644,25 @@ class Autorouter:
                 if not users:
                     del self.usage[key]
         self.routes.pop(job_id, None)
+        for square in self.diagonal_footprints.pop(job_id, ()):
+            users = self.diagonal_usage.get(square)
+            if users:
+                users.pop(job_id, None)
+                if not users:
+                    del self.diagonal_usage[square]
 
-    def _conflicts(self) -> tuple[set[int], set[int]]:
+    def _path_blockers(self, job: RoutingJob, path: list[Cell]) -> set[int]:
+        blockers: set[int] = set()
+        for index, cell in enumerate(path):
+            conflicts, _ = self._dynamic_context(cell, job)
+            blockers.update(conflicts)
+            if index:
+                blockers.update(self._diagonal_blockers(path[index - 1], cell, job))
+        return blockers
+
+    def _conflict_details(self) -> tuple[set[int], set[tuple[int, int]]]:
         cells: set[int] = set()
-        jobs: set[int] = set()
-        checked: set[tuple[int, int]] = set()
+        pairs: set[tuple[int, int]] = set()
         for key, users in self.usage.items():
             cell = self._cell_from_key(key)
             x, y = self._point(cell)
@@ -606,8 +675,7 @@ class Autorouter:
                         continue
                     other_key = self._key(nearby)
                     for other_id in self.usage.get(other_key, ()):
-                        pair = (min(job_id, other_id), max(job_id, other_id))
-                        if job_id == other_id or pair in checked:
+                        if job_id == other_id:
                             continue
                         other = self.jobs_by_id[other_id]
                         if other.net == job.net:
@@ -615,10 +683,108 @@ class Autorouter:
                         ox, oy = self._point(nearby)
                         required = job.width / 2 + other.width / 2 + self.clearance
                         if (x - ox) ** 2 + (y - oy) ** 2 < (required - 1e-7) ** 2:
-                            checked.add(pair)
                             cells.update((key, other_key))
-                            jobs.update((job_id, other_id))
+                            pairs.add((min(job_id, other_id), max(job_id, other_id)))
+        for square, users in self.diagonal_usage.items():
+            for first, second in itertools.combinations(users, 2):
+                if (users[first] != users[second] and
+                        self.jobs_by_id[first].net != self.jobs_by_id[second].net):
+                    cells.add(self._key(square))
+                    pairs.add((min(first, second), max(first, second)))
+        return cells, pairs
+
+    def _conflicts(self) -> tuple[set[int], set[int]]:
+        cells, pairs = self._conflict_details()
+        jobs = {job_id for pair in pairs for job_id in pair}
         return cells, jobs
+
+    def _legalize_routes(self, present_factor: float) -> set[int]:
+        """Keep a conflict-free subset, then strictly retry every removed job.
+
+        A crossing is never written to the final board merely to increase the
+        route count.  Failed retries become explicit unrouted connections.
+        """
+        _, pairs = self._conflict_details()
+        adjacency: dict[int, set[int]] = {job_id: set() for job_id in self.routes}
+        for first, second in pairs:
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+        removed: set[int] = set()
+        while pairs:
+            job_id = max(
+                (candidate for candidate, neighbours in adjacency.items() if neighbours),
+                key=lambda candidate: (len(adjacency[candidate]),
+                                       math.dist(self.jobs_by_id[candidate].start,
+                                                 self.jobs_by_id[candidate].goal), candidate),
+            )
+            for neighbour in adjacency[job_id]:
+                adjacency[neighbour].discard(job_id)
+            adjacency[job_id].clear()
+            removed.add(job_id)
+            pairs = {pair for pair in pairs if job_id not in pair}
+            self._remove(job_id)
+        # Shorter jobs usually fit in the available local gaps; a long job
+        # that cannot be placed is reported for manual/layer-change routing.
+        retry_order = sorted(removed,
+                             key=lambda job_id: (math.dist(self.jobs_by_id[job_id].start,
+                                                           self.jobs_by_id[job_id].goal), job_id))
+        failed: set[int] = set()
+        for job_id in retry_order:
+            job = self.jobs_by_id[job_id]
+            path = self._route_job(job, present_factor, True)
+            if path is None:
+                path = self._astar(job, (0, self.cols - 1, 0, self.rows - 1),
+                                   present_factor, True)
+            if path is None:
+                failed.add(job_id)
+            else:
+                self._commit(job, path)
+        return failed
+
+    def _shove_unrouted(self, failed: set[int], present_factor: float) -> set[int]:
+        """Try local route swaps while preserving zero-crossing output."""
+        if not self.config.max_shove_blockers:
+            return failed
+        for job_id in sorted(failed,
+                             key=lambda item: (math.dist(self.jobs_by_id[item].start,
+                                                         self.jobs_by_id[item].goal), item)):
+            job = self.jobs_by_id[job_id]
+            candidate = self._route_job(job, present_factor)
+            if candidate is None:
+                continue
+            blockers = self._path_blockers(job, candidate)
+            if not 0 < len(blockers) <= self.config.max_shove_blockers:
+                continue
+            old_paths = {other_id: self.routes[other_id] for other_id in blockers}
+            for other_id in blockers:
+                self._remove(other_id)
+            candidate = self._route_job(job, present_factor, True)
+            if candidate is None:
+                candidate = self._astar(job, (0, self.cols - 1, 0, self.rows - 1),
+                                        present_factor, True)
+            if candidate is not None:
+                self._commit(job, candidate)
+            rebuilt = {}
+            if candidate is not None:
+                for other_id in sorted(blockers,
+                                       key=lambda item: (math.dist(self.jobs_by_id[item].start,
+                                                                   self.jobs_by_id[item].goal), item)):
+                    other = self.jobs_by_id[other_id]
+                    path = self._route_job(other, present_factor, True)
+                    if path is None:
+                        break
+                    self._commit(other, path)
+                    rebuilt[other_id] = path
+            if candidate is None or len(rebuilt) != len(blockers):
+                if candidate is not None:
+                    self._remove(job_id)
+                for other_id in rebuilt:
+                    self._remove(other_id)
+                for other_id, old_path in old_paths.items():
+                    self._commit(self.jobs_by_id[other_id], old_path)
+            else:
+                failed.remove(job_id)
+        return failed
 
     def _polyline(self, job: RoutingJob, cells: list[Cell]) -> list[list[float]]:
         points: list[Point] = [job.start]
@@ -641,10 +807,39 @@ class Autorouter:
             simplified.append(point)
         return [[x, y] for x, y in simplified]
 
+    @staticmethod
+    def _geometric_crossings(wires: list[dict]) -> set[tuple[int, int]]:
+        """Find proper centerline crossings, including off-grid end segments."""
+        segments = []
+        for wire in wires:
+            for a, b in zip(wire['points'], wire['points'][1:]):
+                segments.append((a, b, wire['net'], wire['autoroute_job']))
+
+        def side(a: list[float], b: list[float], c: list[float]) -> float:
+            return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+        crossings: set[tuple[int, int]] = set()
+        for index, (a, b, net, job_id) in enumerate(segments):
+            for c, d, other_net, other_id in segments[index + 1:]:
+                if job_id == other_id or net == other_net:
+                    continue
+                if (max(a[0], b[0]) <= min(c[0], d[0]) or
+                        max(c[0], d[0]) <= min(a[0], b[0]) or
+                        max(a[1], b[1]) <= min(c[1], d[1]) or
+                        max(c[1], d[1]) <= min(a[1], b[1])):
+                    continue
+                if (side(a, b, c) * side(a, b, d) < -1e-9 and
+                        side(c, d, a) * side(c, d, b) < -1e-9):
+                    crossings.add((min(job_id, other_id), max(job_id, other_id)))
+        return crossings
+
     def route(self, progress: Progress | None = None) -> tuple[list[dict], RouteReport]:
         started = time.monotonic()
         report = RouteReport(self.layer, len(self.jobs), config=asdict(self.config))
-        ordered = sorted(self.jobs, key=lambda job: (-job.width, -math.dist(job.start, job.goal), job.id))
+        if self.config.short_routes_first:
+            ordered = sorted(self.jobs, key=lambda job: (math.dist(job.start, job.goal), -job.width, job.id))
+        else:
+            ordered = sorted(self.jobs, key=lambda job: (-job.width, -math.dist(job.start, job.goal), job.id))
 
         def update(done: int, message: str) -> bool:
             if progress is None:
@@ -655,7 +850,10 @@ class Autorouter:
             if not update(done, f"Initial routing: {job.net}"):
                 report.cancelled = True
                 break
-            path = self._route_job(job, self.config.present_congestion_cost)
+            path = (self._route_job(job, self.config.present_congestion_cost, True)
+                    if self.config.hard_avoidance else None)
+            if path is None:
+                path = self._route_job(job, self.config.present_congestion_cost)
             if path is None:
                 report.failed.append({"job": job.id, "net": job.net, "reason": "no path"})
             else:
@@ -684,7 +882,10 @@ class Autorouter:
                     break
                 old_path = self.routes.get(job_id)
                 self._remove(job_id)
-                path = self._route_job(job, self.config.present_congestion_cost * (iteration + 1))
+                factor = self.config.present_congestion_cost * (iteration + 1)
+                path = self._route_job(job, factor, self.config.hard_avoidance)
+                if path is None:
+                    path = self._route_job(job, factor)
                 if path is None and old_path is not None:
                     path = old_path
                 if path is not None:
@@ -699,23 +900,60 @@ class Autorouter:
         if len(current_conflicts) > best_conflict_count:
             self.usage.clear()
             self.footprints.clear()
+            self.diagonal_usage.clear()
+            self.diagonal_footprints.clear()
             self.routes.clear()
             for job_id, path in best_routes.items():
                 self._commit(self.jobs_by_id[job_id], path)
 
+        if self.config.strict_final and not report.cancelled:
+            failed_final = self._legalize_routes(
+                self.config.present_congestion_cost * self.config.iterations
+            )
+            failed_final = self._shove_unrouted(
+                failed_final, self.config.present_congestion_cost * self.config.iterations
+            )
+            for job_id in sorted(failed_final):
+                job = self.jobs_by_id[job_id]
+                report.failed.append({"job": job.id, "net": job.net,
+                                      "reason": "conflict-free route not found"})
+
         conflict_cells, conflict_jobs = self._conflicts()
         report.conflict_cells = len(conflict_cells)
         report.conflicting_jobs = sorted(conflict_jobs)
-        wires = []
-        for job in sorted(self.jobs, key=lambda value: value.id):
-            path = self.routes.get(job.id)
-            if path is None:
-                continue
-            points = self._polyline(job, path)
-            report.wire_length += sum(math.dist(a, b) for a, b in zip(points, points[1:]))
-            wires.append({"layer": job.layer, "width": job.width, "net": job.net,
-                          "route_type": "autoroute", "points": points,
-                          "autoroute_job": job.id})
+        def output_wires() -> list[dict]:
+            result = []
+            for job in sorted(self.jobs, key=lambda value: value.id):
+                path = self.routes.get(job.id)
+                if path is None:
+                    continue
+                result.append({"layer": job.layer, "width": job.width, "net": job.net,
+                               "route_type": "autoroute", "points": self._polyline(job, path),
+                               "autoroute_job": job.id})
+            return result
+
+        wires = output_wires()
+        if self.config.strict_final and not report.cancelled:
+            crossings = self._geometric_crossings(wires)
+            while crossings:
+                severity = {job_id: sum(job_id in pair for pair in crossings)
+                            for pair in crossings for job_id in pair}
+                rejected_id = max(severity, key=lambda job_id: (severity[job_id],
+                                   math.dist(self.jobs_by_id[job_id].start,
+                                             self.jobs_by_id[job_id].goal), job_id))
+                self._remove(rejected_id)
+                job = self.jobs_by_id[rejected_id]
+                report.failed.append({"job": job.id, "net": job.net,
+                                      "reason": "geometric crossing in final route"})
+                wires = output_wires()
+                crossings = self._geometric_crossings(wires)
+            conflict_cells, conflict_jobs = self._conflicts()
+            report.conflict_cells = len(conflict_cells)
+            report.conflicting_jobs = sorted(conflict_jobs)
+        report.wire_length = sum(
+            math.dist(a, b) for wire in wires
+            for a, b in zip(wire['points'], wire['points'][1:])
+        )
         report.routed = len(wires)
         report.wire_length = round(report.wire_length, 3)
         report.elapsed_seconds = round(time.monotonic() - started, 3)

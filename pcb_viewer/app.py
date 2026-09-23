@@ -8,7 +8,8 @@ from PySide6.QtGui import QAction, QColor, QPainter, QPainterPath, QPen, QBrush,
 from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraphicsView,
     QGraphicsItem, QDockWidget, QWidget, QVBoxLayout, QLabel, QComboBox, QLineEdit,
     QCheckBox, QPushButton, QPlainTextEdit, QFileDialog, QMessageBox, QDoubleSpinBox,
-    QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressDialog)
+    QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressDialog, QTabBar,
+    QSizePolicy)
 from .model import Document, COLLECTIONS
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
@@ -133,11 +134,28 @@ class MainWindow(QMainWindow):
     def __init__(self, filename=None):
         super().__init__()
         self.document = Document()
+        self.sessions = []
+        self.current_session = -1
         self.resize(1440, 900)
         self.view = BoardView(self)
         self.setCentralWidget(self.view)
         self.coords = QLabel('Source coordinates')
         self.statusBar().addPermanentWidget(self.coords)
+
+        tab_toolbar = QToolBar('Open boards')
+        tab_toolbar.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tab_toolbar)
+        self.tabs = QTabBar()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideMiddle)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.tabs.currentChanged.connect(self.switch_tab)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        tab_toolbar.addWidget(self.tabs)
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+
         toolbar = QToolBar('Board tools')
         self.addToolBar(toolbar)
         def action(name, shortcut, callback):
@@ -216,8 +234,7 @@ class MainWindow(QMainWindow):
         dock.setWidget(panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.view.scene().selectionChanged.connect(self.selection_changed)
-        self.reset_layers()
-        self.refresh()
+        self.add_session(self.document)
         if filename:
             self.load(filename)
 
@@ -243,38 +260,144 @@ class MainWindow(QMainWindow):
         self.active_layer.clear()
         self.active_layer.addItems(self.document.layers)
 
+    def session_state(self):
+        return {
+            'visible_layer': self.visible_layer.currentText(),
+            'active_layer': self.active_layer.currentText(),
+            'keepout_type': self.keepout_type.currentText(),
+            'grid': self.grid.value(),
+            'search': self.search.text(),
+            'categories': {group: checkbox.isChecked() for group, checkbox in self.categories.items()},
+            'mode': self.mode.currentText(),
+            'transform': self.view.transform(),
+            'center': self.view.mapToScene(self.view.viewport().rect().center()),
+        }
+
+    def save_session_state(self):
+        if 0 <= self.current_session < len(self.sessions):
+            self.sessions[self.current_session]['state'] = self.session_state()
+
+    def restore_session_state(self, state):
+        self.reset_layers()
+        if state is None:
+            self.refresh()
+            self.fit()
+            return
+        self.visible_layer.blockSignals(True)
+        if state['visible_layer'] in [self.visible_layer.itemText(i) for i in range(self.visible_layer.count())]:
+            self.visible_layer.setCurrentText(state['visible_layer'])
+        self.visible_layer.blockSignals(False)
+        self.active_layer.setCurrentText(state['active_layer'])
+        self.keepout_type.setCurrentText(state['keepout_type'])
+        self.grid.setValue(state['grid'])
+        self.search.setText(state['search'])
+        for group, checked in state['categories'].items():
+            if group in self.categories:
+                self.categories[group].blockSignals(True)
+                self.categories[group].setChecked(checked)
+                self.categories[group].blockSignals(False)
+        self.mode.setCurrentText(state['mode'])
+        self.refresh()
+        self.view.setTransform(state['transform'])
+        self.view.centerOn(state['center'])
+
+    def add_session(self, document):
+        self.save_session_state()
+        self.sessions.append({'document': document, 'state': None})
+        index = len(self.sessions) - 1
+        self.tabs.blockSignals(True)
+        self.tabs.addTab(document.path.name if document.path else 'Untitled')
+        self.tabs.setCurrentIndex(index)
+        self.tabs.blockSignals(False)
+        self.activate_tab(index)
+
+    def activate_tab(self, index):
+        if not 0 <= index < len(self.sessions):
+            return
+        if index != self.current_session:
+            self.save_session_state()
+        self.current_session = index
+        self.document = self.sessions[index]['document']
+        self.restore_session_state(self.sessions[index]['state'])
+        self.title()
+
+    def switch_tab(self, index):
+        if index != self.current_session:
+            self.activate_tab(index)
+
     def allowed(self):
         if not self.document.dirty:
             return True
-        answer = QMessageBox.question(self, 'Unsaved changes', 'Save changes before continuing?',
+        name = self.document.path.name if self.document.path else 'Untitled'
+        answer = QMessageBox.question(self, 'Unsaved changes', f'Save changes to {name}?',
             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
         if answer == QMessageBox.StandardButton.Save:
             return self.save()
         return answer == QMessageBox.StandardButton.Discard
 
     def new(self):
-        if self.allowed():
-            self.document = Document()
-            self.reset_layers()
-            self.refresh()
-            self.fit()
+        self.add_session(Document())
 
     def open(self):
-        if not self.allowed():
-            return
-        filename,_ = QFileDialog.getOpenFileName(self, 'Open PCB JSON', 'pcb_example', 'PCB JSON (*.json)')
-        if filename:
-            self.load(filename)
+        filenames,_ = QFileDialog.getOpenFileNames(self, 'Open PCB JSON', 'pcb_example', 'PCB JSON (*.json)')
+        for filename in filenames:
+            self.open_in_tab(filename)
+
+    def open_in_tab(self, filename):
+        try:
+            path = Path(filename).resolve()
+            for index, session in enumerate(self.sessions):
+                existing = session['document'].path
+                if existing and existing.resolve() == path:
+                    self.tabs.setCurrentIndex(index)
+                    return True
+            candidate = Document.load(filename)
+            if self.document.path is None and not self.document.dirty:
+                self.document = candidate
+                self.sessions[self.current_session] = {'document': candidate, 'state': None}
+                self.restore_session_state(None)
+                self.title()
+            else:
+                self.add_session(candidate)
+            return True
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            QMessageBox.critical(self, 'Cannot open board', str(e))
+            return False
 
     def load(self, filename):
+        """Replace the active tab; retained for startup and programmatic use."""
         try:
             candidate = Document.load(filename)
             self.document = candidate
-            self.reset_layers()
-            self.refresh()
-            self.fit()
+            if self.current_session < 0:
+                self.add_session(candidate)
+            else:
+                self.sessions[self.current_session] = {'document': candidate, 'state': None}
+                self.restore_session_state(None)
+                self.title()
         except (OSError, ValueError, TypeError, KeyError) as e:
             QMessageBox.critical(self, 'Cannot open board', str(e))
+
+    def close_tab(self, index):
+        if not 0 <= index < len(self.sessions):
+            return
+        if index != self.current_session:
+            self.tabs.setCurrentIndex(index)
+        if not self.allowed():
+            return
+        self.sessions.pop(index)
+        self.tabs.blockSignals(True)
+        self.tabs.removeTab(index)
+        self.tabs.blockSignals(False)
+        self.current_session = -1
+        if self.sessions:
+            target = min(index, len(self.sessions) - 1)
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(target)
+            self.tabs.blockSignals(False)
+            self.activate_tab(target)
+        else:
+            self.add_session(Document())
 
     def save(self, save_as=False):
         filename = self.document.path
@@ -294,10 +417,25 @@ class MainWindow(QMainWindow):
             return False
 
     def title(self):
-        self.setWindowTitle(f'{"* " if self.document.dirty else ""}{self.document.path.name if self.document.path else "Untitled"} — PCB Studio')
+        name = self.document.path.name if self.document.path else 'Untitled'
+        label = f'{"* " if self.document.dirty else ""}{name}'
+        if 0 <= self.current_session < self.tabs.count():
+            self.tabs.setTabText(self.current_session, label)
+            self.tabs.setTabToolTip(self.current_session, str(self.document.path or 'Unsaved board'))
+        self.setWindowTitle(f'{label} — PCB Studio')
 
     def closeEvent(self, event):
-        event.accept() if self.allowed() else event.ignore()
+        original = self.current_session
+        for index, session in enumerate(self.sessions):
+            if not session['document'].dirty:
+                continue
+            self.tabs.setCurrentIndex(index)
+            if not self.allowed():
+                event.ignore()
+                return
+        if 0 <= original < len(self.sessions):
+            self.tabs.setCurrentIndex(original)
+        event.accept()
 
     def history(self, redo):
         self.document.redo() if redo else self.document.undo()
@@ -441,6 +579,12 @@ class MainWindow(QMainWindow):
                   f'{report.conflict_cells} remaining trace-clearance conflict locations; '
                   f'{len(report.failed)} unrouted connections.\n\n'
                   'Generated traces are one undoable edit. Review and run final fabrication DRC before use.')
+        if report.failed:
+            names = [entry['net'] for entry in report.failed]
+            preview = ', '.join(names[:12])
+            if len(names) > 12:
+                preview += f' … (+{len(names) - 12} more)'
+            detail += f'\n\nUnrouted: {preview}'
         QMessageBox.information(self, title, detail)
 
     def refresh(self, *_):

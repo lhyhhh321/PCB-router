@@ -142,3 +142,30 @@ def test_open_resets_stale_controls(qt_app):
     assert w.view.mode == 'Select'
     assert w.categories['keepouts'].isChecked()
     w.close()
+
+
+def test_multiple_board_tabs_preserve_document_and_view_state(qt_app):
+    from pcb_viewer.app import MainWindow
+    w = MainWindow()
+    assert w.tabs.count() == 1
+    assert w.open_in_tab(str(SAMPLES[0]))
+    first = w.document
+    w.search.setText('first-tab-filter')
+    w.grid.setValue(3.5)
+    assert w.open_in_tab(str(SAMPLES[1]))
+    second = w.document
+    assert w.tabs.count() == 2 and second is not first
+    w.search.setText('second-tab-filter')
+    w.tabs.setCurrentIndex(0)
+    qt_app.processEvents()
+    assert w.document is first
+    assert w.search.text() == 'first-tab-filter'
+    assert w.grid.value() == 3.5
+    w.tabs.setCurrentIndex(1)
+    qt_app.processEvents()
+    assert w.document is second
+    assert w.search.text() == 'second-tab-filter'
+    # Opening an already-open path focuses its tab rather than duplicating it.
+    assert w.open_in_tab(str(SAMPLES[0]))
+    assert w.tabs.count() == 2 and w.tabs.currentIndex() == 0
+    w.close()

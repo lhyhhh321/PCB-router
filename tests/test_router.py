@@ -28,7 +28,7 @@ def test_routes_around_wire_keepout():
     assert report.wire_length > math.sqrt(800)
 
 
-def test_archived_trace_becomes_coarse_guide_not_output_geometry():
+def test_archived_trace_supplies_endpoints_but_never_a_route_guide():
     board = {
         'layer': 'TOP',
         'metadata': {'layers': [{'name': 'TOP', 'type': 'signal'}]},
@@ -40,7 +40,7 @@ def test_archived_trace_becomes_coarse_guide_not_output_geometry():
     }
     jobs = extract_jobs(board)
     assert jobs[0].start == (0.0, 0.0) and jobs[0].goal == (20.0, 20.0)
-    assert len(jobs[0].guide) == 3
+    assert jobs[0].guide == ()
     wires, report = Autorouter(
         board, RouterConfig(grid_step=2, boundary_margin=20, guide_margin=8, iterations=1)
     ).route()
@@ -65,3 +65,29 @@ def test_via_keepout_does_not_block_trace_but_wire_keepout_does():
                                                             boundary_margin=10, guide_margin=5))
     assert len(via_wires[0]['points']) == 2
     assert len(wire_wires[0]['points']) > 2
+
+
+def test_opposing_diagonals_are_detected_even_without_shared_grid_node():
+    board = {
+        'layer': 'TOP',
+        'routing_connections': [
+            {'net': 'A', 'layer': 'TOP', 'width': 1, 'start': [0, 0], 'end': [10, 10]},
+            {'net': 'B', 'layer': 'TOP', 'width': 1, 'start': [0, 10], 'end': [10, 0]},
+        ],
+    }
+    wires, report = autoroute_data(
+        board, RouterConfig(grid_step=1, clearance=0, boundary_margin=0,
+                            guide_margin=0, iterations=2, max_shove_blockers=0)
+    )
+    assert report.routed == 1
+    assert len(report.failed) == 1
+    assert report.conflict_cells == 0
+    assert len(wires) == 1
+
+
+def test_geometric_crossing_guard_detects_off_grid_segments():
+    wires = [
+        {'net': 'A', 'autoroute_job': 0, 'points': [[0.2, 0.2], [5.7, 5.7]]},
+        {'net': 'B', 'autoroute_job': 1, 'points': [[0.3, 5.7], [5.8, 0.2]]},
+    ]
+    assert Autorouter._geometric_crossings(wires) == {(0, 1)}

@@ -23,7 +23,7 @@ On Windows, activate with `.venv\Scripts\activate`. `python main.py` is an equiv
 
 ## Viewing and editing
 
-- Open/save JSON with Ctrl+O / Ctrl+S; Save as uses Ctrl+Shift+S. New creates a blank TOP-layer document.
+- Open one or several JSON files with Ctrl+O. Each board has a browser-style tab at the top; clicking a tab restores that board's layer, filter, tool settings, and viewport. The tab close button checks for unsaved changes. Save uses Ctrl+S, Save as uses Ctrl+Shift+S, and New opens a blank TOP-layer tab.
 - Choose a visible layer or All layers. Toggle wires, vias, pins, pads, copper polygons, component origins, and keepouts separately.
 - Wheel zooms around the pointer; middle/right drag pans; F fits visible geometry. The initial full-board view displays the first layer for readability.
 - Enter a net or reference substring and press Enter to filter geometry. Keepouts remain visible.
@@ -42,11 +42,11 @@ python -m pcb_viewer --autoroute \
   --output /tmp/pcb-routed.json --grid 2 --iterations 6
 ```
 
-The router reads explicit `routing_connections` records (`start`, `end`, `net`, `width`, and `layer`). For this repository's testcase, it reads `deleted_connections.wires`; archived polylines are Douglas–Peucker-coarsened into soft global guides rather than copied as output traces.
+The router reads explicit `routing_connections` records (`start`, `end`, `net`, `width`, and `layer`). For this repository's testcase, it reads only those fields and the two endpoints from `deleted_connections.wires`. Every archived interior point is ignored: file 02 is never loaded, compared, or used as a reference. An explicitly authored `routing_connections[].guide` remains supported for other input formats.
 
-The flow follows TritonRoute's broad architecture: pin/grid access, global-guide-aware track routing, DRC-aware A* maze search, then iterative rip-up and search-and-repair with present and historical congestion costs. PCB pads, vias, copper polygons, existing traces, per-net same-copper access, trace widths, design-rule clearance, and `wire_keepout` polygons participate in obstacle checks. `via_keepout` masks do not block a trace on the current layer.
+The flow follows TritonRoute's broad architecture: pin/grid access, pattern routing, DRC-aware A* maze search, then iterative rip-up and search-and-repair with present and historical congestion costs. Optional explicit guides can bias the search, but the supplied testcase is routed from endpoints. PCB pads, vias, copper polygons, existing traces, per-net same-copper access, trace widths, design-rule clearance, and `wire_keepout` polygons participate in obstacle checks. `via_keepout` masks do not block a trace on the current layer.
 
-The command writes an `autoroute_report` into the output. Exit status is 0 for a conflict-free result, 2 when output was produced but still has unrouted connections or approximate trace-clearance conflicts, and 1 for an input/runtime error. A status-2 board is intentionally preserved for inspection instead of being presented as fabrication-ready.
+The command writes an `autoroute_report` into the output. A final legalization pass removes trace crossings and lists connections that could not be routed without a crossing. It also checks the emitted polylines for geometric intersections. Exit status is 0 for a fully routed conflict-free result, 2 when output was produced with unrouted connections or remaining approximate clearance conflicts, and 1 for an input/runtime error. A status-2 board is preserved for inspection.
 
 This is currently a single-layer research router: it does not insert vias, tune differential pairs, enforce length/impedance constraints, or replace a PCB manufacturer's final DRC. See [ROUTER_DESIGN.md](ROUTER_DESIGN.md) for the data contract, cost model, implementation stages, and limitations.
 
