@@ -1,15 +1,17 @@
 """Qt desktop interface; display coordinates invert Y, stored coordinates do not."""
 import copy
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
-from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, QSettings
 from PySide6.QtGui import QAction, QColor, QPainter, QPainterPath, QPen, QBrush, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraphicsView,
     QGraphicsItem, QDockWidget, QWidget, QVBoxLayout, QLabel, QComboBox, QLineEdit,
     QCheckBox, QPushButton, QPlainTextEdit, QFileDialog, QMessageBox, QDoubleSpinBox,
     QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressDialog, QTabBar,
-    QSizePolicy)
+    QSizePolicy, QHBoxLayout)
 from .model import Document, COLLECTIONS
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
@@ -211,6 +213,10 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText('Filter by net or component reference…')
         self.search.returnPressed.connect(self.refresh)
         layout.addWidget(self.search)
+        self.show_unrouted = QCheckBox('Show unrouted connections (dashed)')
+        self.show_unrouted.setChecked(False)
+        self.show_unrouted.toggled.connect(self.refresh)
+        layout.addWidget(self.show_unrouted)
         self.categories = {}
         for group in COLLECTIONS:
             cb = QCheckBox(group.replace('_',' ').title())
@@ -247,6 +253,9 @@ class MainWindow(QMainWindow):
         self.view.cancel()
         self.mode.setCurrentText("Select")
         self.search.clear()
+        self.show_unrouted.blockSignals(True)
+        self.show_unrouted.setChecked(False)
+        self.show_unrouted.blockSignals(False)
         for group, cb in self.categories.items():
             cb.blockSignals(True)
             cb.setChecked(group != "components")
@@ -267,6 +276,7 @@ class MainWindow(QMainWindow):
             'keepout_type': self.keepout_type.currentText(),
             'grid': self.grid.value(),
             'search': self.search.text(),
+            'show_unrouted': self.show_unrouted.isChecked(),
             'categories': {group: checkbox.isChecked() for group, checkbox in self.categories.items()},
             'mode': self.mode.currentText(),
             'transform': self.view.transform(),
@@ -291,6 +301,9 @@ class MainWindow(QMainWindow):
         self.keepout_type.setCurrentText(state['keepout_type'])
         self.grid.setValue(state['grid'])
         self.search.setText(state['search'])
+        self.show_unrouted.blockSignals(True)
+        self.show_unrouted.setChecked(state.get('show_unrouted', False))
+        self.show_unrouted.blockSignals(False)
         for group, checked in state['categories'].items():
             if group in self.categories:
                 self.categories[group].blockSignals(True)
@@ -506,9 +519,44 @@ class MainWindow(QMainWindow):
 
     def autoroute(self):
         from .router import RouterConfig, autoroute_data
+        from .freerouting import freeroute_data
         dialog = QDialog(self)
         dialog.setWindowTitle('PCB auto router')
         layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('Algorithm'))
+        algorithm = QComboBox()
+        algorithm.addItems(['Built-in (TritonRoute-inspired)', 'Freerouting benchmark'])
+        layout.addWidget(algorithm)
+        layout.addWidget(QLabel('Built-in routing priority'))
+        ordering = QComboBox()
+        ordering.addItems(['Higher completion (dense areas first)', 'Faster (short routes first)'])
+        layout.addWidget(ordering)
+        layout.addWidget(QLabel('Freerouting JAR (required for benchmark)'))
+        jar_row = QHBoxLayout()
+        jar_field = QLineEdit()
+        jar_field.setPlaceholderText('Select a Freerouting .jar file…')
+        jar_field.setText(os.environ.get('FREEROUTING_JAR',
+                          QSettings('PCB Studio', 'PCB Studio').value('freerouting_jar', '')))
+        jar_row.addWidget(jar_field)
+        browse_jar = QPushButton('Browse…')
+        browse_jar.clicked.connect(lambda: jar_field.setText(
+            QFileDialog.getOpenFileName(dialog, 'Freerouting JAR', jar_field.text(),
+                                        'Java archives (*.jar)')[0] or jar_field.text()))
+        jar_row.addWidget(browse_jar)
+        layout.addLayout(jar_row)
+        layout.addWidget(QLabel('Java runtime (leave blank for automatic selection)'))
+        java_row = QHBoxLayout()
+        java_field = QLineEdit()
+        java_field.setPlaceholderText('Java 25 bin/java for current Freerouting releases…')
+        java_field.setText(os.environ.get('FREEROUTING_JAVA',
+                           QSettings('PCB Studio', 'PCB Studio').value('freerouting_java', '')))
+        java_row.addWidget(java_field)
+        browse_java = QPushButton('Browse…')
+        browse_java.clicked.connect(lambda: java_field.setText(
+            QFileDialog.getOpenFileName(dialog, 'Java executable', java_field.text())[0]
+            or java_field.text()))
+        java_row.addWidget(browse_java)
+        layout.addLayout(java_row)
         fields = {}
         defaults = {
             'Grid spacing': 2.0,
@@ -527,7 +575,12 @@ class MainWindow(QMainWindow):
         iterations.setRange(1, 64)
         iterations.setValue(6)
         layout.addWidget(iterations)
-        note = QLabel('Connections come from routing_connections, or from the endpoints in deleted_connections.wires. Existing copper, pads, vias, traces, and wire keepouts are treated as obstacles.')
+        layout.addWidget(QLabel('Freerouting time limit (minutes)'))
+        freerouting_minutes = QSpinBox()
+        freerouting_minutes.setRange(1, 240)
+        freerouting_minutes.setValue(10)
+        layout.addWidget(freerouting_minutes)
+        note = QLabel('Only the open JSON board is used. Deleted trace interiors are ignored. The Freerouting benchmark runs an external JAR through a temporary single-layer DSN; non-terminal copper is conservatively fixed as obstacles.')
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -540,11 +593,20 @@ class MainWindow(QMainWindow):
         scratch = copy.deepcopy(self.document.data)
         scratch['wires'] = [wire for wire in scratch.get('wires', [])
                             if wire.get('route_type') != 'autoroute']
+        scratch.pop('autoroute_report', None)
+        benchmark_input = hashlib.sha256(json.dumps(
+            scratch, sort_keys=True, ensure_ascii=False,
+            separators=(',', ':')).encode('utf-8')).hexdigest()
         config = RouterConfig(grid_step=fields['Grid spacing'].value(),
                               clearance=fields['Clearance'].value(),
                               iterations=iterations.value(),
+                              ordering='dense_first' if ordering.currentIndex() == 0 else 'short',
                               layer=self.visible_layer.currentText()
                               if self.visible_layer.currentText() != 'All layers' else None)
+        use_freerouting = algorithm.currentIndex() == 1
+        if use_freerouting:
+            QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_jar', jar_field.text())
+            QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_java', java_field.text())
         progress = QProgressDialog('Preparing routing grid…', 'Cancel', 0, 1000, self)
         progress.setWindowTitle('Auto routing')
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -555,8 +617,11 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             return not progress.wasCanceled()
         try:
-            wires, report = autoroute_data(scratch, config, update)
-        except (ValueError, TypeError, KeyError) as error:
+            wires, report = (freeroute_data(scratch, config, jar_field.text(), update,
+                                           freerouting_minutes.value() * 60,
+                                           java_field.text() or None)
+                             if use_freerouting else autoroute_data(scratch, config, update))
+        except (ValueError, TypeError, KeyError, OSError) as error:
             progress.close()
             QMessageBox.warning(self, 'Auto route failed', str(error))
             return
@@ -574,11 +639,28 @@ class MainWindow(QMainWindow):
         self.document.batch_change(changes)
         self.refresh()
         self.fit()
+        backend = 'Freerouting' if use_freerouting else 'Built-in'
+        session = self.sessions[self.current_session]
+        if session.get('benchmark_input') != benchmark_input:
+            session['benchmarks'] = {}
+            session['benchmark_input'] = benchmark_input
+        benchmarks = session['benchmarks']
+        benchmarks[backend] = report
         title = 'Auto routing complete' if report.clean else 'Auto routing needs review'
-        detail = (f'{report.routed}/{report.jobs_total} connections routed in {report.elapsed_seconds:.1f}s.\n'
-                  f'{report.conflict_cells} remaining trace-clearance conflict locations; '
+        conflict_label = ('generated-trace centerline crossings' if use_freerouting
+                          else 'trace-clearance conflict locations')
+        detail = (f'{backend}: '
+                  f'{report.routed}/{report.jobs_total} connections routed in {report.elapsed_seconds:.1f}s.\n'
+                  f'{report.wire_length:.1f} source units of new copper.\n'
+                  f'{report.conflict_cells} remaining {conflict_label}; '
                   f'{len(report.failed)} unrouted connections.\n\n'
                   'Generated traces are one undoable edit. Review and run final fabrication DRC before use.')
+        if len(benchmarks) > 1:
+            detail += '\n\nThis tab’s benchmark runs:\n'
+            for name, result in benchmarks.items():
+                detail += (f'{name}: {result.routed}/{result.jobs_total} routed, '
+                           f'{result.wire_length:.1f} length, '
+                           f'{result.elapsed_seconds:.1f}s\n')
         if report.failed:
             names = [entry['net'] for entry in report.failed]
             preview = ', '.join(names[:12])
@@ -669,9 +751,26 @@ class MainWindow(QMainWindow):
                 item.setData(0,(group,index))
                 item.setToolTip(f'{group}[{index}]\n{obj.get("net",obj.get("ref",obj.get("type","")))}\n{obj_layer or ", ".join(layers)}')
                 count += 1
+        unrouted_count = 0
+        if self.show_unrouted.isChecked():
+            from .router import extract_jobs
+            routed = {job_id for wire in data.get('wires', [])
+                      if wire.get('route_type') == 'autoroute'
+                      for job_id in wire.get('autoroute_jobs', [wire.get('autoroute_job')])}
+            for job in extract_jobs(data):
+                if job.id in routed or (not all_layers and job.layer != layer):
+                    continue
+                if search and search not in job.net.lower():
+                    continue
+                pen = QPen(QColor('#ffcf66'), 0, Qt.PenStyle.DashLine)
+                item = scene.addPath(path_for((job.start, job.goal)), pen)
+                item.setZValue(12)
+                item.setToolTip(f'Unrouted: {job.net} (connection {job.id})')
+                unrouted_count += 1
         scene.blockSignals(False)
         self.properties.clear()
-        self.summary.setText(f'{len(data.get("wires", [])):,} wires  ·  {len(data.get("vias", [])):,} vias\n{len(data.get("keepouts", []))} keepouts  ·  {count:,} visible objects')
+        overlay = f'  ·  {unrouted_count} unrouted shown' if self.show_unrouted.isChecked() else ''
+        self.summary.setText(f'{len(data.get("wires", [])):,} wires  ·  {len(data.get("vias", [])):,} vias\n{len(data.get("keepouts", []))} keepouts  ·  {count:,} visible objects{overlay}')
         self.title()
 
 

@@ -48,6 +48,26 @@ def test_archived_trace_supplies_endpoints_but_never_a_route_guide():
     assert wires[0]['points'] != board['deleted_connections']['wires'][0]['points']
 
 
+def test_initial_no_path_job_gets_final_shove_attempt():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'N', 'layer': 'TOP', 'width': 2,
+         'start': [0, 0], 'end': [20, 0]},
+    ]}
+    router = Autorouter(board, RouterConfig(iterations=1, boundary_margin=10))
+    router._route_job = lambda *args: None
+    router._legalize_routes = lambda *args: set()
+    retried = []
+
+    def capture(failed, *_):
+        retried.append(set(failed))
+        return failed
+
+    router._shove_unrouted = capture
+    _, report = router.route()
+    assert retried == [{0}]
+    assert report.routed == 0 and len(report.failed) == 1
+
+
 def test_via_keepout_does_not_block_trace_but_wire_keepout_does():
     base = {
         'layer': 'TOP',
@@ -91,3 +111,32 @@ def test_geometric_crossing_guard_detects_off_grid_segments():
         {'net': 'B', 'autoroute_job': 1, 'points': [[0.3, 5.7], [5.8, 0.2]]},
     ]
     assert Autorouter._geometric_crossings(wires) == {(0, 1)}
+
+
+def test_shared_same_net_corridor_is_emitted_only_once():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'N', 'layer': 'TOP', 'width': 2, 'start': [0, 0], 'end': [10, 0]},
+        {'net': 'N', 'layer': 'TOP', 'width': 2, 'start': [0, 0], 'end': [20, 0]},
+    ]}
+    wires, report = autoroute_data(
+        board, RouterConfig(grid_step=1, clearance=0, iterations=1,
+                            boundary_margin=10, guide_margin=5))
+    assert report.routed == 2 and report.clean
+    assert math.isclose(report.wire_length, 20)
+    assert {job for wire in wires for job in wire['autoroute_jobs']} == {0, 1}
+    edges = [tuple(sorted((tuple(a), tuple(b)))) for wire in wires
+             for a, b in zip(wire['points'], wire['points'][1:])]
+    assert len(edges) == len(set(edges))
+
+
+def test_shared_corridor_keeps_the_widest_required_copper():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'N', 'layer': 'TOP', 'width': 2, 'start': [0, 0], 'end': [10, 0]},
+        {'net': 'N', 'layer': 'TOP', 'width': 4, 'start': [0, 0], 'end': [20, 0]},
+    ]}
+    wires, report = autoroute_data(
+        board, RouterConfig(grid_step=1, clearance=0, iterations=1,
+                            boundary_margin=10, guide_margin=5))
+    assert report.routed == 2
+    assert math.isclose(report.wire_length, 20)
+    assert all(wire['width'] == 4 for wire in wires)

@@ -25,6 +25,7 @@ On Windows, activate with `.venv\Scripts\activate`. `python main.py` is an equiv
 
 - Open one or several JSON files with Ctrl+O. Each board has a browser-style tab at the top; clicking a tab restores that board's layer, filter, tool settings, and viewport. The tab close button checks for unsaved changes. Save uses Ctrl+S, Save as uses Ctrl+Shift+S, and New opens a blank TOP-layer tab.
 - Choose a visible layer or All layers. Toggle wires, vias, pins, pads, copper polygons, component origins, and keepouts separately.
+- Enable **Show unrouted connections (dashed)** to display straight-line airwires for every requested connection without generated copper. The toggle is saved per open tab and does not modify the JSON.
 - Wheel zooms around the pointer; middle/right drag pans; F fits visible geometry. The initial full-board view displays the first layer for readability.
 - Enter a net or reference substring and press Enter to filter geometry. Keepouts remain visible.
 - Click geometry to inspect its original JSON. Edit coordinates, net, layer, width, or other properties, then click **Apply properties**. Shift-click or drag a selection rectangle to select several objects. **Move selected by offset** translates geometry; Delete removes selected objects.
@@ -32,7 +33,7 @@ On Windows, activate with `.venv\Scripts\activate`. `python main.py` is an equiv
 
 ## Auto routing
 
-The app includes a single-layer, octilinear detailed router. Open a routing input, select its signal layer, and choose **Auto route…** (Ctrl+R). The dialog controls grid spacing, copper clearance, and search-and-repair passes. All generated traces are committed as one undoable edit and use `route_type: "autoroute"`.
+The app includes a single-layer, octilinear detailed router and an optional [Freerouting](https://github.com/freerouting/freerouting) benchmark. Open a routing input, select its signal layer, and choose **Auto route…** (Ctrl+R). Select the algorithm in the dialog; for Freerouting, provide a downloaded `.jar` (or set `FREEROUTING_JAR`). The built-in router defaults to denser-area-first priority for higher completion; short-route-first is faster. The dialog also controls grid spacing, copper clearance, routing passes, and the Freerouting time limit. All generated traces are committed as one undoable edit and use `route_type: "autoroute"`.
 
 For headless runs:
 
@@ -40,13 +41,26 @@ For headless runs:
 python -m pcb_viewer --autoroute \
   "pcb_example/03第三层右侧删去线网（布线输入）.json" \
   --output /tmp/pcb-routed.json --grid 2 --iterations 6
+
+# Optional external benchmark, using the same JSON input:
+python -m pcb_viewer --autoroute \
+  "pcb_example/03第三层右侧删去线网（布线输入）.json" \
+  --algorithm freerouting --freerouting-jar /path/to/freerouting.jar \
+  --java /path/to/jre-25/bin/java \
+  --output /tmp/pcb-freerouted.json
 ```
 
 The router reads explicit `routing_connections` records (`start`, `end`, `net`, `width`, and `layer`). For this repository's testcase, it reads only those fields and the two endpoints from `deleted_connections.wires`. Every archived interior point is ignored: file 02 is never loaded, compared, or used as a reference. An explicitly authored `routing_connections[].guide` remains supported for other input formats.
 
 The flow follows TritonRoute's broad architecture: pin/grid access, pattern routing, DRC-aware A* maze search, then iterative rip-up and search-and-repair with present and historical congestion costs. Optional explicit guides can bias the search, but the supplied testcase is routed from endpoints. PCB pads, vias, copper polygons, existing traces, per-net same-copper access, trace widths, design-rule clearance, and `wire_keepout` polygons participate in obstacle checks. `via_keepout` masks do not block a trace on the current layer.
 
-The command writes an `autoroute_report` into the output. A final legalization pass removes trace crossings and lists connections that could not be routed without a crossing. It also checks the emitted polylines for geometric intersections. Exit status is 0 for a fully routed conflict-free result, 2 when output was produced with unrouted connections or remaining approximate clearance conflicts, and 1 for an input/runtime error. A status-2 board is preserved for inspection.
+The built-in router emits shared same-net grid edges only once; one requested connection may therefore produce no new copper when it is already covered by another generated branch. The report counts connected requests, while the wire array counts physical trace fragments. An optional reverse-direction pin escape is available through `RouterConfig.reverse_escape`.
+
+The Freerouting adapter exports a temporary single-layer Specctra DSN from the *same open JSON*, runs the external Java router, and imports its session (`.ses`). It does not inspect file 02 or archived trace interiors. It preserves existing wires and copper polygons as protected geometry, and treats non-terminal pad/via copper as fixed keepouts. For a net with several requested widths, the widest width is used for its Freerouting net class. These adapter choices are conservative but mean its result is a benchmark rather than an identical internal search-space comparison. The app shows route count, wire length, and time for both algorithms after they are run on the same tab from the same unchanged input. The app does not bundle or download the JAR; see [official releases](https://github.com/freerouting/freerouting/releases). A six-pass Freerouting 2.1.0 run on the supplied sample completed in about 216 seconds (166/220 requested connections); the default benchmark time limit is ten minutes.
+
+Current Freerouting releases require Java 25; older JARs such as 2.1.0 can run on Java 21. The app inspects the selected JAR's main class to determine its minimum Java version, then selects a compatible runtime from `FREEROUTING_JAVA`, `JAVA_HOME`, a macOS Java installation, or `PATH`. In the Auto route dialog you can instead browse to a specific `bin/java` executable; for headless runs use `--java /path/to/bin/java`. An incompatible or missing runtime produces a clear error before routing starts. This changes only the app's Freerouting subprocess, not the machine's system-wide Java version. The [Freerouting installation guide](https://github.com/freerouting/freerouting#running-freerouting-using-java-jre) describes obtaining a Java 25 JRE.
+
+The command writes an `autoroute_report` into the output. The built-in router's final legalization pass removes trace crossings and lists connections that could not be routed without a crossing. Both backends check emitted polylines for proper centerline intersections; this is not a full fabrication DRC. Exit status is 0 for a fully routed conflict-free result, 2 when output was produced with unrouted connections or reported conflicts, and 1 for an input/runtime error. A status-2 board is preserved for inspection.
 
 This is currently a single-layer research router: it does not insert vias, tune differential pairs, enforce length/impedance constraints, or replace a PCB manufacturer's final DRC. See [ROUTER_DESIGN.md](ROUTER_DESIGN.md) for the data contract, cost model, implementation stages, and limitations.
 

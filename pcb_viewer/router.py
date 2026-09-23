@@ -36,6 +36,8 @@ class RouterConfig:
     hard_avoidance: bool = True
     max_shove_blockers: int = 4
     short_routes_first: bool = True
+    ordering: str = "dense_first"
+    reverse_escape: bool = False
     strict_final: bool = True
 
     def validate(self) -> None:
@@ -51,6 +53,8 @@ class RouterConfig:
             raise ValueError("Maximum A* expansions must be positive.")
         if self.max_shove_blockers < 0:
             raise ValueError("Maximum shove blockers cannot be negative.")
+        if self.ordering not in ("short", "dense_first"):
+            raise ValueError("Routing order must be short or dense_first.")
         for label, value in (("bend penalty", self.bend_penalty),
                              ("present congestion cost", self.present_congestion_cost),
                              ("history cost", self.history_cost),
@@ -619,6 +623,22 @@ class Autorouter:
                 return route
         return None
 
+    def _route_reversed(self, job: RoutingJob, present_factor: float,
+                        hard_avoidance: bool = True) -> list[Cell] | None:
+        """Try the opposite search direction when a pin escape is asymmetric.
+
+        The A* search waives fixed-copper collisions at its destination cell;
+        dense terminal clusters can therefore have a viable escape in one
+        direction even when the first search could not discover it.
+        """
+        backward = RoutingJob(job.id, job.net, job.goal, job.start, job.width,
+                              job.layer, job.route_type, tuple(reversed(job.guide)))
+        route = self._route_job(backward, present_factor, hard_avoidance)
+        if route is None:
+            route = self._astar(backward, (0, self.cols - 1, 0, self.rows - 1),
+                                present_factor, hard_avoidance)
+        return list(reversed(route)) if route is not None else None
+
     def _commit(self, job: RoutingJob, path: list[Cell]) -> None:
         footprint = set()
         diagonals = set()
@@ -735,6 +755,8 @@ class Autorouter:
             if path is None:
                 path = self._astar(job, (0, self.cols - 1, 0, self.rows - 1),
                                    present_factor, True)
+            if path is None and self.config.reverse_escape:
+                path = self._route_reversed(job, present_factor)
             if path is None:
                 failed.add(job_id)
             else:
@@ -750,6 +772,8 @@ class Autorouter:
                                                          self.jobs_by_id[item].goal), item)):
             job = self.jobs_by_id[job_id]
             candidate = self._route_job(job, present_factor)
+            if candidate is None and self.config.reverse_escape:
+                candidate = self._route_reversed(job, present_factor, False)
             if candidate is None:
                 continue
             blockers = self._path_blockers(job, candidate)
@@ -762,6 +786,8 @@ class Autorouter:
             if candidate is None:
                 candidate = self._astar(job, (0, self.cols - 1, 0, self.rows - 1),
                                         present_factor, True)
+            if candidate is None and self.config.reverse_escape:
+                candidate = self._route_reversed(job, present_factor)
             if candidate is not None:
                 self._commit(job, candidate)
             rebuilt = {}
@@ -771,6 +797,8 @@ class Autorouter:
                                                                    self.jobs_by_id[item].goal), item)):
                     other = self.jobs_by_id[other_id]
                     path = self._route_job(other, present_factor, True)
+                    if path is None and self.config.reverse_escape:
+                        path = self._route_reversed(other, present_factor)
                     if path is None:
                         break
                     self._commit(other, path)
@@ -787,9 +815,7 @@ class Autorouter:
         return failed
 
     def _polyline(self, job: RoutingJob, cells: list[Cell]) -> list[list[float]]:
-        points: list[Point] = [job.start]
-        points.extend(self._point(cell) for cell in cells[1:-1])
-        points.append(job.goal)
+        points = self._raw_points(job, cells)
         deduped: list[Point] = []
         for point in points:
             rounded = (round(point[0], 6), round(point[1], 6))
@@ -806,6 +832,69 @@ class Autorouter:
                 simplified.pop()
             simplified.append(point)
         return [[x, y] for x, y in simplified]
+
+    def _raw_points(self, job: RoutingJob, cells: list[Cell]) -> list[Point]:
+        """Keep every grid edge until duplicate same-net copper is removed."""
+        return [job.start, *(self._point(cell) for cell in cells[1:-1]), job.goal]
+
+    def _unique_wire_runs(self) -> list[dict]:
+        """Emit each shared same-net edge once, without disconnecting a net.
+
+        Two requested connections can legitimately use the same grid corridor.
+        Their independent A* routes must not become two physical copper traces
+        over one another.  The first route owns each edge; later routes are
+        split around already emitted edges, which remain conductive bridges.
+        """
+        seen: dict[str, dict[tuple[Point, Point], dict]] = {}
+        wires = []
+        # A shared edge must be owned by the widest requested trace; otherwise
+        # deduplication could silently narrow a later, wider connection.
+        for job in sorted(self.jobs, key=lambda value: (-value.width, value.id)):
+            cells = self.routes.get(job.id)
+            if cells is None:
+                continue
+            raw = self._raw_points(job, cells)
+            owned = seen.setdefault(job.net, {})
+            run: list[Point] = []
+            run_edges: list[tuple[Point, Point]] = []
+
+            def flush() -> None:
+                if len(run) < 2:
+                    return
+                # Reuse the collinear simplifier on arbitrary run endpoints.
+                fragment = RoutingJob(job.id, job.net, run[0], run[-1],
+                                      job.width, job.layer)
+                points = self._polyline(fragment, [self._cell(p) for p in run])
+                # _polyline snaps interior points to the grid; raw interior
+                # points are already on-grid by construction.
+                wire = {"layer": job.layer, "width": job.width,
+                        "net": job.net, "route_type": "autoroute",
+                        "points": points, "autoroute_job": job.id,
+                        "autoroute_jobs": [job.id]}
+                wires.append(wire)
+                for edge in run_edges:
+                    owned[edge] = wire
+
+            for a, b in zip(raw, raw[1:]):
+                first = (round(a[0], 6), round(a[1], 6))
+                second = (round(b[0], 6), round(b[1], 6))
+                if first == second:
+                    continue
+                edge = tuple(sorted((first, second)))
+                if edge in owned:
+                    flush()
+                    run = []
+                    run_edges = []
+                    owner = owned[edge]
+                    if job.id not in owner['autoroute_jobs']:
+                        owner['autoroute_jobs'].append(job.id)
+                    continue
+                if not run:
+                    run = [first]
+                run.append(second)
+                run_edges.append(edge)
+            flush()
+        return wires
 
     @staticmethod
     def _geometric_crossings(wires: list[dict]) -> set[tuple[int, int]]:
@@ -835,8 +924,18 @@ class Autorouter:
 
     def route(self, progress: Progress | None = None) -> tuple[list[dict], RouteReport]:
         started = time.monotonic()
-        report = RouteReport(self.layer, len(self.jobs), config=asdict(self.config))
-        if self.config.short_routes_first:
+        report = RouteReport(self.layer, len(self.jobs),
+                             config={"backend": "builtin", **asdict(self.config)})
+        if self.config.ordering == "dense_first":
+            terminals = [(other.net, point) for other in self.jobs
+                         for point in (other.start, other.goal)]
+            def density(job: RoutingJob) -> int:
+                return sum(other_net != job.net and math.dist(point, other_point) < 50
+                           for point in (job.start, job.goal)
+                           for other_net, other_point in terminals)
+            ordered = sorted(self.jobs, key=lambda job: (-density(job),
+                             math.dist(job.start, job.goal), -job.width, job.id))
+        elif self.config.short_routes_first:
             ordered = sorted(self.jobs, key=lambda job: (math.dist(job.start, job.goal), -job.width, job.id))
         else:
             ordered = sorted(self.jobs, key=lambda job: (-job.width, -math.dist(job.start, job.goal), job.id))
@@ -910,27 +1009,21 @@ class Autorouter:
             failed_final = self._legalize_routes(
                 self.config.present_congestion_cost * self.config.iterations
             )
+            # Initial maze failures were not part of the conflict graph; they
+            # deserve the same post-legalization shove opportunity.
+            failed_final.update(job.id for job in self.jobs if job.id not in self.routes)
             failed_final = self._shove_unrouted(
                 failed_final, self.config.present_congestion_cost * self.config.iterations
             )
-            for job_id in sorted(failed_final):
-                job = self.jobs_by_id[job_id]
-                report.failed.append({"job": job.id, "net": job.net,
-                                      "reason": "conflict-free route not found"})
+            report.failed = [{"job": job.id, "net": job.net,
+                              "reason": "conflict-free route not found"}
+                             for job in self.jobs if job.id in failed_final]
 
         conflict_cells, conflict_jobs = self._conflicts()
         report.conflict_cells = len(conflict_cells)
         report.conflicting_jobs = sorted(conflict_jobs)
         def output_wires() -> list[dict]:
-            result = []
-            for job in sorted(self.jobs, key=lambda value: value.id):
-                path = self.routes.get(job.id)
-                if path is None:
-                    continue
-                result.append({"layer": job.layer, "width": job.width, "net": job.net,
-                               "route_type": "autoroute", "points": self._polyline(job, path),
-                               "autoroute_job": job.id})
-            return result
+            return self._unique_wire_runs()
 
         wires = output_wires()
         if self.config.strict_final and not report.cancelled:
@@ -954,7 +1047,11 @@ class Autorouter:
             math.dist(a, b) for wire in wires
             for a, b in zip(wire['points'], wire['points'][1:])
         )
-        report.routed = len(wires)
+        report.routed = len(self.routes)
+        reasons = {entry['job']: entry['reason'] for entry in report.failed}
+        report.failed = [{"job": job.id, "net": job.net,
+                          "reason": reasons.get(job.id, "not routed")}
+                         for job in self.jobs if job.id not in self.routes]
         report.wire_length = round(report.wire_length, 3)
         report.elapsed_seconds = round(time.monotonic() - started, 3)
         update(len(self.jobs), "Routing complete")

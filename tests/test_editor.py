@@ -169,3 +169,23 @@ def test_multiple_board_tabs_preserve_document_and_view_state(qt_app):
     assert w.open_in_tab(str(SAMPLES[0]))
     assert w.tabs.count() == 2 and w.tabs.currentIndex() == 0
     w.close()
+
+
+def test_unrouted_overlay_is_optional_and_follows_active_tab(qt_app):
+    from pcb_viewer.app import MainWindow
+    w = MainWindow()
+    w.document.data['routing_connections'] = [
+        {'net': 'N1', 'layer': 'TOP', 'width': 2, 'start': [0, 0], 'end': [20, 0]},
+    ]
+    w.show_unrouted.setChecked(True)
+    assert any('Unrouted: N1' in item.toolTip() for item in w.view.scene().items())
+    w.new()
+    assert not w.show_unrouted.isChecked()
+    w.tabs.setCurrentIndex(0)
+    assert w.show_unrouted.isChecked()
+    w.document.data['wires'] = [{'net': 'N1', 'layer': 'TOP', 'width': 2,
+                                 'route_type': 'autoroute', 'autoroute_job': 0,
+                                 'points': [[0, 0], [20, 0]]}]
+    w.refresh()
+    assert not any('Unrouted: N1' in item.toolTip() for item in w.view.scene().items())
+    w.close()
