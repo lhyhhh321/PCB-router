@@ -53,14 +53,16 @@ def main():
                         help='Maximum movable routes per force round (default: 12)')
     parser.add_argument('--detailed-max-passes', type=int, default=32,
                         help='Detailed straighten/drag passes (0 disables; default: 32)')
+    parser.add_argument('--detailed-drag-states', type=int, default=12,
+                        help='Bounded segment-slide search states per missed connection (0 disables; default: 12)')
     parser.add_argument('--attraction-strength', type=float, default=0.5,
                         help='Inter-net spacing attraction (0 disables; default: 0.5)')
     parser.add_argument('--max-detour-ratio', type=float, default=3.0,
                         help='Reject extreme route stretch after repair (0 disables; default: 3)')
     parser.add_argument('--ordering', choices=('dense_first', 'short'), default='dense_first',
                         help='Built-in route priority (default: dense_first)')
-    parser.add_argument('--random-rounds', type=int, default=3,
-                        help='Built-in order trials including baseline (default: 3; 1 disables randomized trials)')
+    parser.add_argument('--random-rounds', type=int, default=1,
+                        help='Built-in order trials including baseline (default: 1; increase for randomized trials)')
     parser.add_argument('--random-seed', type=int, default=0,
                         help='Reproducible seed for built-in randomized trials (default: 0)')
     parser.add_argument('--algorithm', choices=('builtin', 'freerouting'), default='builtin',
@@ -88,6 +90,7 @@ def main():
                                   force_iterations=args.force_iterations,
                                   force_max_jobs=args.force_max_jobs,
                                   detailed_max_passes=args.detailed_max_passes,
+                                  detailed_drag_states=args.detailed_drag_states,
                                   attraction_strength=args.attraction_strength,
                                   max_detour_ratio=args.max_detour_ratio,
                                   random_rounds=args.random_rounds,

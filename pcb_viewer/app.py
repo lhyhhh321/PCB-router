@@ -5,13 +5,14 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, QSettings
 from PySide6.QtGui import QAction, QColor, QPainter, QPainterPath, QPen, QBrush, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraphicsView,
     QGraphicsItem, QDockWidget, QWidget, QVBoxLayout, QLabel, QComboBox, QLineEdit,
     QCheckBox, QPushButton, QPlainTextEdit, QFileDialog, QMessageBox, QDoubleSpinBox,
-    QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressDialog, QTabBar,
+    QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressBar, QTabBar,
     QSizePolicy, QHBoxLayout, QGroupBox, QFormLayout)
 from .model import Document, COLLECTIONS
 from .router import extract_jobs
@@ -20,7 +21,7 @@ COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#db
 
 
 def auto_route_statistics(data):
-    """Summarize marked automatic and manual copper against route requests."""
+    """Summarize routed copper against route requests, including older files."""
     jobs = extract_jobs(data)
     jobs_by_id = {job.id: job for job in jobs}
     nets = {}
@@ -29,6 +30,8 @@ def auto_route_statistics(data):
     routed = set()
     wire_length = 0.0
     for wire in data.get('wires', []):
+        # Read-only compatibility: old documents can still contain hand-drawn
+        # copper even though this app no longer offers a manual-routing mode.
         if wire.get('route_type') not in ('autoroute', 'manualroute'):
             continue
         points = wire.get('points', [])
@@ -49,38 +52,6 @@ def auto_route_statistics(data):
         'connections_routed': len(routed),
         'wire_length': wire_length,
     }
-
-
-def simplify_route_points(points):
-    """Keep only endpoints and true bends in a manually drawn polyline."""
-    simplified = []
-    for raw in points:
-        point = [float(raw[0]), float(raw[1])]
-        if simplified and point == simplified[-1]:
-            continue
-        while len(simplified) >= 2:
-            a, b = simplified[-2], simplified[-1]
-            cross = ((b[0] - a[0]) * (point[1] - b[1]) -
-                     (b[1] - a[1]) * (point[0] - b[0]))
-            forward = ((b[0] - a[0]) * (point[0] - b[0]) +
-                       (b[1] - a[1]) * (point[1] - b[1]))
-            if abs(cross) > 1e-9 or forward < 0:
-                break
-            simplified.pop()
-        simplified.append(point)
-    return simplified
-
-
-def matching_route_jobs(data, net, layer, points, tolerance=1e-6):
-    """Return request IDs whose two terminals are the manual trace endpoints."""
-    if len(points) < 2:
-        return []
-    first, last = points[0], points[-1]
-    close = lambda a, b: math.dist(a, b) <= tolerance
-    return [job.id for job in extract_jobs(data)
-            if job.net == net and job.layer == layer and
-            ((close(first, job.start) and close(last, job.goal)) or
-             (close(first, job.goal) and close(last, job.start)))]
 
 
 def path_for(points, close=False):
@@ -116,7 +87,6 @@ class BoardView(QGraphicsView):
         self.setCursor(Qt.CursorShape.ArrowCursor if mode == 'Select' else Qt.CursorShape.CrossCursor)
         self.window.statusBar().showMessage({
             'Select': 'Select an object to inspect or edit. Middle/right drag pans; wheel zooms.',
-            'Route': 'Click to place trace bends. Enter or double-click finishes; Backspace removes a bend; Esc cancels.',
             'Rectangle': 'Click two opposite corners to place a keepout. Esc cancels.',
             'Polygon': 'Click vertices; Enter finishes the keepout. Esc cancels.',
         }[mode])
@@ -170,27 +140,11 @@ class BoardView(QGraphicsView):
             if self.mode == 'Rectangle':
                 a = self.points[0]
                 pts = [a,[x,a[1]],[x,y],[a[0],y]]
-            if self.mode == 'Route':
-                pen = QPen(QColor('#6ee7ff'), self.window.route_width.value(),
-                           Qt.PenStyle.DashLine)
-                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-                self.preview = self.scene().addPath(path_for(pts), pen)
-            else:
-                pen = QPen(QColor('#ff6584'), 0, Qt.PenStyle.DashLine)
-                self.preview = self.scene().addPath(path_for(pts, True), pen,
-                                                    QBrush(QColor(255,70,110,35)))
+            pen = QPen(QColor('#ff6584'), 0, Qt.PenStyle.DashLine)
+            self.preview = self.scene().addPath(path_for(pts, True), pen,
+                                                QBrush(QColor(255,70,110,35)))
             self.preview.setZValue(100)
         super().mouseMoveEvent(event)
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.mode == 'Route':
-            point = self.coordinate(event)
-            if not self.points or point != self.points[-1]:
-                self.points.append(point)
-            self.finish(self.points)
-            return
-        super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self.pan is not None:
@@ -201,11 +155,7 @@ class BoardView(QGraphicsView):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.cancel()
-        elif event.key() == Qt.Key.Key_Backspace and self.mode == 'Route' and self.points:
-            self.points.pop()
-            if not self.points:
-                self.cancel()
-        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.mode in ('Polygon', 'Route'):
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.mode == 'Polygon':
             self.finish(self.points)
         else:
             super().keyPressEvent(event)
@@ -213,31 +163,14 @@ class BoardView(QGraphicsView):
     def finish(self, points):
         try:
             layer = self.window.active_layer.currentText()
-            if self.mode == 'Route':
-                points = simplify_route_points(points)
-                net = self.window.route_net.currentText().strip()
-                if not net:
-                    raise ValueError('Choose or enter a net name before routing.')
-                if len(points) < 2:
-                    raise ValueError('A manual trace requires at least two distinct points.')
-                jobs = matching_route_jobs(self.window.document.data, net, layer, points)
-                obj = {'net': net, 'layer': layer,
-                       'width': self.window.route_width.value(),
-                       'route_type': 'manualroute', 'points': points}
-                if jobs:
-                    obj['route_jobs'] = jobs
-                self.window.document.change(
-                    'wires', len(self.window.document.data.get('wires', [])), obj)
-            else:
-                obj = {'type': self.window.keepout_type.currentText(), 'layer':layer,
-                       'shape':'polygon', 'points': points}
-                self.window.document.change(
-                    'keepouts', len(self.window.document.data.get('keepouts', [])), obj)
+            obj = {'type': self.window.keepout_type.currentText(), 'layer':layer,
+                   'shape':'polygon', 'points': points}
+            self.window.document.change(
+                'keepouts', len(self.window.document.data.get('keepouts', [])), obj)
             self.cancel()
             self.window.refresh()
         except ValueError as e:
-            QMessageBox.warning(self, 'Invalid route' if self.mode == 'Route' else 'Invalid keepout',
-                                str(e))
+            QMessageBox.warning(self, 'Invalid keepout', str(e))
             if self.mode == 'Rectangle':
                 self.cancel()
 
@@ -251,10 +184,22 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.view = BoardView(self)
         self.setCentralWidget(self.view)
+        self._routing_preview_items = {}
+        self._routing_preview_airwires = {}
+        self._routing_preview_hidden = []
+        self._routing_preview_round = None
+        self._routing_preview_document = None
+        self._routing_preview_labels = None
+        self._routing_preview_last_paint = 0.0
+        self._routing_in_progress = False
+        self._route_progress_label = None
+        self._route_progress_bar = None
+        self._route_cancel_button = None
         self.coords = QLabel('Source coordinates')
         self.statusBar().addPermanentWidget(self.coords)
 
         tab_toolbar = QToolBar('Open boards')
+        self.tab_toolbar = tab_toolbar
         tab_toolbar.setMovable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tab_toolbar)
         self.tabs = QTabBar()
@@ -269,6 +214,7 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
 
         toolbar = QToolBar('Board tools')
+        self.main_toolbar = toolbar
         self.addToolBar(toolbar)
         def action(name, shortcut, callback):
             a = QAction(name, self)
@@ -290,13 +236,14 @@ class MainWindow(QMainWindow):
         action('Auto route…', 'Ctrl+R', self.autoroute)
         toolbar.addSeparator()
         self.mode = QComboBox()
-        self.mode.addItems(['Select', 'Route', 'Rectangle', 'Polygon'])
+        self.mode.addItems(['Select', 'Rectangle', 'Polygon'])
         self.mode.currentTextChanged.connect(self.view.set_mode)
         toolbar.addWidget(self.mode)
-        action('Finish drawing', 'Ctrl+Return', lambda: self.view.finish(self.view.points)
-               if self.view.mode in ('Polygon', 'Route') else None)
+        action('Finish polygon', 'Ctrl+Return', lambda: self.view.finish(self.view.points)
+               if self.view.mode == 'Polygon' else None)
         action('Delete', 'Delete', self.delete)
         dock = QDockWidget('Board & selection', self)
+        self.side_dock = dock
         dock.setMinimumWidth(310)
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -320,7 +267,7 @@ class MainWindow(QMainWindow):
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             route_layout.addRow(title, label)
             self.route_stat_labels[key] = label
-        route_group.setToolTip('Board-wide counts from routing requests and marked automatic or manual traces. A net is routed only when all of its requested connections are routed.')
+        route_group.setToolTip('Board-wide counts from routing requests and marked routed traces. A net is routed only when all of its requested connections are routed.')
         layout.addWidget(route_group)
         layout.addWidget(QLabel('Visible layer'))
         self.visible_layer = QComboBox()
@@ -329,19 +276,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel('Editing layer'))
         self.active_layer = QComboBox()
         layout.addWidget(self.active_layer)
-        manual_group = QGroupBox('Manual routing')
-        manual_layout = QFormLayout(manual_group)
-        self.route_net = QComboBox()
-        self.route_net.setEditable(True)
-        self.route_net.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.route_net.setToolTip('Choose an existing net or type a new net name.')
-        manual_layout.addRow('Net', self.route_net)
-        self.route_width = QDoubleSpinBox()
-        self.route_width.setRange(0.001, 1000.0)
-        self.route_width.setDecimals(3)
-        self.route_width.setValue(2.0)
-        manual_layout.addRow('Trace width', self.route_width)
-        layout.addWidget(manual_group)
         layout.addWidget(QLabel('Keepout type'))
         self.keepout_type = QComboBox()
         self.keepout_type.addItems(['wire_keepout', 'via_keepout'])
@@ -377,7 +311,7 @@ class MainWindow(QMainWindow):
         move = QPushButton('Move selected by offset…')
         move.clicked.connect(self.move_selected)
         layout.addWidget(move)
-        help_text = QLabel('Wheel: zoom  •  Middle/right drag: pan\nRoute: clicks place bends; Enter/double-click finishes; Backspace removes a bend\nRectangle: two clicks  •  Polygon: clicks + Enter\nEsc: cancel  •  Delete: remove selection')
+        help_text = QLabel('Wheel: zoom  •  Middle/right drag: pan\nRectangle: two clicks  •  Polygon: clicks + Enter\nEsc: cancel  •  Delete: remove selection')
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
         dock.setWidget(panel)
@@ -411,23 +345,12 @@ class MainWindow(QMainWindow):
         self.visible_layer.blockSignals(False)
         self.active_layer.clear()
         self.active_layer.addItems(self.document.layers)
-        current_net = self.route_net.currentText().strip()
-        nets = sorted({str(obj.get('net')).strip()
-                       for group in ('routing_connections', 'wires', 'pins', 'pads', 'vias')
-                       for obj in self.document.data.get(group, [])
-                       if isinstance(obj, dict) and obj.get('net')})
-        self.route_net.clear()
-        self.route_net.addItems(nets)
-        if current_net and current_net not in nets:
-            self.route_net.setEditText(current_net)
 
     def session_state(self):
         return {
             'visible_layer': self.visible_layer.currentText(),
             'active_layer': self.active_layer.currentText(),
             'keepout_type': self.keepout_type.currentText(),
-            'route_net': self.route_net.currentText(),
-            'route_width': self.route_width.value(),
             'grid': self.grid.value(),
             'search': self.search.text(),
             'show_unrouted': self.show_unrouted.isChecked(),
@@ -453,8 +376,6 @@ class MainWindow(QMainWindow):
         self.visible_layer.blockSignals(False)
         self.active_layer.setCurrentText(state['active_layer'])
         self.keepout_type.setCurrentText(state['keepout_type'])
-        self.route_net.setEditText(state.get('route_net', self.route_net.currentText()))
-        self.route_width.setValue(state.get('route_width', 2.0))
         self.grid.setValue(state['grid'])
         self.search.setText(state['search'])
         self.show_unrouted.blockSignals(True)
@@ -594,6 +515,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f'{label} — PCB Studio')
 
     def closeEvent(self, event):
+        if self._routing_in_progress:
+            self.statusBar().showMessage('Cancel routing before closing the board.', 5000)
+            event.ignore()
+            return
         original = self.current_session
         for index, session in enumerate(self.sessions):
             if not session['document'].dirty:
@@ -616,6 +541,119 @@ class MainWindow(QMainWindow):
             rect = QRectF(-100,-100,200,200)
         self.view.setSceneRect(rect.adjusted(-100,-100,100,100))
         self.view.fitInView(rect.adjusted(-20,-20,20,20), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _begin_routing_preview(self):
+        """Hide old generated copper without changing the document or undo stack."""
+        self._end_routing_preview()
+        self._routing_preview_document = self.document
+        old_indices = {index for index, wire in
+                       enumerate(self.document.data.get('wires', []))
+                       if wire.get('route_type') == 'autoroute'}
+        for item in self.view.scene().items():
+            identity = item.data(0)
+            if (isinstance(identity, tuple) and len(identity) == 2 and
+                    ((identity[0] == 'wires' and identity[1] in old_indices) or
+                     identity[0] == 'unrouted')):
+                item.setVisible(False)
+                self._routing_preview_hidden.append(item)
+        self._routing_preview_labels = (
+            self.summary.text(),
+            {key: label.text() for key, label in self.route_stat_labels.items()},
+        )
+
+    def _end_routing_preview(self):
+        scene = self.view.scene()
+        for _, item, _ in self._routing_preview_items.values():
+            if item.scene() is scene:
+                scene.removeItem(item)
+        self._routing_preview_items.clear()
+        for item in self._routing_preview_airwires.values():
+            if item.scene() is scene:
+                scene.removeItem(item)
+        self._routing_preview_airwires.clear()
+        for item in self._routing_preview_hidden:
+            if item.scene() is scene:
+                item.setVisible(True)
+        self._routing_preview_hidden.clear()
+        if self._routing_preview_labels is not None:
+            summary, labels = self._routing_preview_labels
+            self.summary.setText(summary)
+            for key, value in labels.items():
+                self.route_stat_labels[key].setText(value)
+        self._routing_preview_labels = None
+        self._routing_preview_round = None
+        self._routing_preview_document = None
+        self._routing_preview_last_paint = 0.0
+
+    def _draw_routing_preview(self, router, round_number, total_rounds, message):
+        """Incrementally paint actual provisional grid routes on the open board."""
+        if self.document is not self._routing_preview_document:
+            return
+        now = time.monotonic()
+        changed_round = round_number != self._routing_preview_round
+        if changed_round:
+            for _, item, _ in self._routing_preview_items.values():
+                self.view.scene().removeItem(item)
+            self._routing_preview_items.clear()
+            for item in self._routing_preview_airwires.values():
+                self.view.scene().removeItem(item)
+            self._routing_preview_airwires.clear()
+            self._routing_preview_round = round_number
+        if (not changed_round and message != 'Routing complete' and
+                set(router.routes) == set(self._routing_preview_items) and
+                now - self._routing_preview_last_paint < 0.15):
+            return
+        self._routing_preview_last_paint = now
+        scene = self.view.scene()
+        for job_id in list(self._routing_preview_items):
+            if job_id not in router.routes:
+                scene.removeItem(self._routing_preview_items.pop(job_id)[1])
+        for job_id, cells in router.routes.items():
+            signature = tuple(cells)
+            previous = self._routing_preview_items.get(job_id)
+            if previous is not None and previous[0] == signature:
+                continue
+            if previous is not None:
+                scene.removeItem(previous[1])
+            job = router.jobs_by_id[job_id]
+            points = router._polyline(job, cells)
+            pen = QPen(QColor('#54ffd2'), job.width)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            item = scene.addPath(path_for(points), pen)
+            item.setZValue(8)
+            item.setToolTip(f'Provisional route: {job.net} (connection {job.id})')
+            length = sum(math.dist(a, b) for a, b in zip(points, points[1:]))
+            self._routing_preview_items[job_id] = (signature, item, length)
+        routed = set(router.routes)
+        if self.show_unrouted.isChecked():
+            for job_id in list(self._routing_preview_airwires):
+                if job_id in routed:
+                    scene.removeItem(self._routing_preview_airwires.pop(job_id))
+            for job in router.jobs:
+                if job.id in routed or job.id in self._routing_preview_airwires:
+                    continue
+                pen = QPen(QColor('#ffcf66'), 0, Qt.PenStyle.DashLine)
+                item = scene.addPath(path_for((job.start, job.goal)), pen)
+                item.setZValue(12)
+                item.setToolTip(f'Unrouted (preview): {job.net} (connection {job.id})')
+                self._routing_preview_airwires[job.id] = item
+        net_jobs = {}
+        for job in router.jobs:
+            net_jobs.setdefault(job.net, set()).add(job.id)
+        labels = self.route_stat_labels
+        labels['nets_routed'].setText(str(sum(ids <= routed for ids in net_jobs.values())))
+        labels['nets_total'].setText(str(len(net_jobs)))
+        labels['partial'].setText(str(sum(bool(ids & routed) and not ids <= routed
+                                          for ids in net_jobs.values())))
+        labels['connections'].setText(f'{len(routed)} / {len(router.jobs)} (preview)')
+        labels['unrouted'].setText(str(len(router.jobs) - len(routed)))
+        labels['completion'].setText(f'{len(routed) / len(router.jobs):.1%}')
+        labels['length'].setText(
+            f'≈ {sum(entry[2] for entry in self._routing_preview_items.values()):,.1f} units')
+        self.summary.setText(
+            f'Live routing preview · round {round_number}/{total_rounds}\n'
+            f'{len(routed)}/{len(router.jobs)} provisional connections · {message}')
 
     def selected(self):
         return sorted(set(tuple(item.data(0)) for item in self.view.scene().selectedItems() if item.data(0)))
@@ -692,7 +730,7 @@ class MainWindow(QMainWindow):
         rounds_row.addWidget(rounds_label)
         random_rounds = QSpinBox()
         random_rounds.setRange(1, 16)
-        random_rounds.setValue(3)
+        random_rounds.setValue(1)
         rounds_row.addWidget(random_rounds)
         layout.addLayout(rounds_row)
         seed_row = QHBoxLayout()
@@ -771,6 +809,14 @@ class MainWindow(QMainWindow):
         detail_passes.setValue(32)
         detail_row.addWidget(detail_passes)
         layout.addLayout(detail_row)
+        drag_row = QHBoxLayout()
+        drag_label = QLabel('Detailed drag search states (0 disables)')
+        drag_row.addWidget(drag_label)
+        drag_states = QSpinBox()
+        drag_states.setRange(0, 64)
+        drag_states.setValue(12)
+        drag_row.addWidget(drag_states)
+        layout.addLayout(drag_row)
         attraction_row = QHBoxLayout()
         attraction_label = QLabel('Inter-net attraction (0 disables)')
         attraction_row.addWidget(attraction_label)
@@ -801,6 +847,8 @@ class MainWindow(QMainWindow):
             force_iterations.setEnabled(index == 0),
             detail_label.setEnabled(index == 0),
             detail_passes.setEnabled(index == 0),
+            drag_label.setEnabled(index == 0),
+            drag_states.setEnabled(index == 0),
             attraction_label.setEnabled(index == 0),
             attraction_strength.setEnabled(index == 0),
             detour_label.setEnabled(index == 0),
@@ -833,6 +881,7 @@ class MainWindow(QMainWindow):
                               early_refine_interval=early_interval.value(),
                               force_iterations=force_iterations.value(),
                               detailed_max_passes=detail_passes.value(),
+                              detailed_drag_states=drag_states.value(),
                               attraction_strength=attraction_strength.value(),
                               max_detour_ratio=max_detour_ratio.value(),
                               random_rounds=random_rounds.value(),
@@ -844,25 +893,80 @@ class MainWindow(QMainWindow):
         if use_freerouting:
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_jar', jar_field.text())
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_java', java_field.text())
-        progress = QProgressDialog('Preparing routing grid…', 'Cancel', 0, 1000, self)
-        progress.setWindowTitle('Auto routing')
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
+        previous_mode = self.mode.currentText()
+        self.mode.setCurrentText('Select')
+        action_states = [(action, action.isEnabled())
+                         for action in self.main_toolbar.actions()]
+        for action, _ in action_states:
+            action.setEnabled(False)
+        self.mode.setEnabled(False)
+        self.tabs.setEnabled(False)
+        self.side_dock.setEnabled(False)
+        self._routing_in_progress = True
+        progress_label = QLabel('Preparing routing grid…')
+        progress_label.setMinimumWidth(220)
+        progress_label.setMaximumWidth(560)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 1000)
+        progress_bar.setValue(0)
+        progress_bar.setFixedWidth(170)
+        cancel_button = QPushButton('Cancel routing')
+        cancel_requested = [False]
+        cancel_button.clicked.connect(lambda: cancel_requested.__setitem__(0, True))
+        self.statusBar().addWidget(progress_label, 1)
+        self.statusBar().addPermanentWidget(progress_bar)
+        self.statusBar().addPermanentWidget(cancel_button)
+        self._route_progress_label = progress_label
+        self._route_progress_bar = progress_bar
+        self._route_cancel_button = cancel_button
+        preview_count = [None]
+        routing_document = self.document
+        if not use_freerouting:
+            self._begin_routing_preview()
+        def visualize(router, round_number, total_rounds, message):
+            if self.document is not routing_document:
+                return
+            preview_count[0] = (len(router.routes), len(router.jobs))
+            self._draw_routing_preview(router, round_number, total_rounds, message)
         def update(done, total, message):
-            progress.setLabelText(message)
-            progress.setValue(round(done / max(1, total) * 1000))
+            if self.document is not routing_document:
+                return False
+            label = message
+            if preview_count[0] is not None:
+                routed, requested = preview_count[0]
+                label += f'\nLive board preview: {routed}/{requested} provisional connections'
+            progress_label.setText(label.replace('\n', ' · '))
+            progress_label.setToolTip(label)
+            progress_bar.setValue(round(done / max(1, total) * 1000))
             QApplication.processEvents()
-            return not progress.wasCanceled()
+            return not cancel_requested[0]
+        routing_error = None
         try:
             wires, report = (freeroute_data(scratch, config, jar_field.text(), update,
                                            freerouting_minutes.value() * 60,
                                            java_field.text() or None)
-                             if use_freerouting else autoroute_data(scratch, config, update))
+                             if use_freerouting else autoroute_data(
+                                 scratch, config, update, visualize))
         except (ValueError, TypeError, KeyError, OSError) as error:
-            progress.close()
-            QMessageBox.warning(self, 'Auto route failed', str(error))
+            routing_error = error
+        finally:
+            self._end_routing_preview()
+            for widget in (progress_label, progress_bar, cancel_button):
+                self.statusBar().removeWidget(widget)
+                widget.deleteLater()
+            self._route_progress_label = None
+            self._route_progress_bar = None
+            self._route_cancel_button = None
+            for action, enabled in action_states:
+                action.setEnabled(enabled)
+            self.mode.setEnabled(True)
+            self.tabs.setEnabled(True)
+            self.side_dock.setEnabled(True)
+            self.mode.setCurrentText(previous_mode)
+            self._routing_in_progress = False
+        if routing_error is not None:
+            QMessageBox.warning(self, 'Auto route failed', str(routing_error))
             return
-        progress.close()
         if report.cancelled:
             self.statusBar().showMessage('Auto routing cancelled.', 5000)
             return
@@ -933,6 +1037,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, title, detail)
 
     def refresh(self, *_):
+        if (self._routing_preview_document is not None and
+                self.document is not self._routing_preview_document):
+            self._end_routing_preview()
         self.view.cancel()
         scene = self.view.scene()
         scene.blockSignals(True)
@@ -1027,6 +1134,7 @@ class MainWindow(QMainWindow):
                 pen = QPen(QColor('#ffcf66'), 0, Qt.PenStyle.DashLine)
                 item = scene.addPath(path_for((job.start, job.goal)), pen)
                 item.setZValue(12)
+                item.setData(0, ('unrouted', job.id))
                 item.setToolTip(f'Unrouted: {job.net} (connection {job.id})')
                 unrouted_count += 1
         scene.blockSignals(False)

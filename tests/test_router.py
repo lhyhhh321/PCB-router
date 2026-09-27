@@ -29,6 +29,32 @@ def test_routes_around_wire_keepout():
     assert report.wire_length > math.sqrt(800)
 
 
+def test_live_preview_callback_reports_actual_route_snapshots():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+        {'net': 'B', 'layer': 'TOP', 'width': 1,
+         'start': [0, 10], 'end': [20, 10]},
+    ]}
+    snapshots = []
+    wires, report = autoroute_data(
+        board, RouterConfig(grid_step=2, clearance=0, boundary_margin=10,
+                            iterations=1, force_iterations=0,
+                            detailed_max_passes=0),
+        preview=lambda router, round_number, total_rounds, message:
+        snapshots.append((round_number, total_rounds, message,
+                          {job_id: tuple(path) for job_id, path in router.routes.items()})),
+    )
+    assert report.routed == 2 and len(wires) == 2
+    assert snapshots[0][3] == {}
+    assert {len(snapshot[3]) for snapshot in snapshots} >= {0, 1, 2}
+    assert snapshots[-1][2] == 'Routing complete'
+    assert snapshots[-1][3].keys() == {0, 1}
+    assert all((round_number, total_rounds) == (1, 1)
+               for round_number, total_rounds, _, _ in snapshots)
+    assert 'wires' not in board
+
+
 def test_seeded_initial_order_is_reproducible_and_changes_sequence():
     board = {'layer': 'TOP', 'routing_connections': [
         {'net': f'N{index}', 'layer': 'TOP', 'width': 2,
@@ -548,23 +574,27 @@ def test_detailed_drag_moves_blocking_bend_trace_transactionally():
                     [(8, 0), (12, 0), (12, -8)]):
         section = router._grid_line(router._cell(a), router._cell(b))
         blocker.extend(section if not blocker else section[1:])
-    clear_blocker = [router._cell((x, -8)) for x in range(8, 13, 2)]
     router._commit(router.jobs[1], blocker)
-    guide = router._detailed_drag_guide(DetailedTrace.from_path(1, blocker),
-                                        target, 4, 1)
-    assert guide[0] == router.jobs[1].start and guide[-1] == router.jobs[1].goal
-    assert len(guide) > len(DetailedTrace.from_path(1, blocker).bends)
-    original_astar = router._astar
-    router._astar = lambda job, bounds, factor, hard=False, history_weight=None: (
-        target if job.id == 0 and not hard else
-        original_astar(job, bounds, factor, hard, history_weight))
+    trace = DetailedTrace.from_path(1, blocker)
+    slid = router._detailed_slide_segment(trace, blocker, 1, -1)
+    assert slid is not None
+    new_trace = DetailedTrace.from_path(1, slid)
+    assert new_trace.bends[0] == trace.bends[0]
+    assert new_trace.bends[-1] == trace.bends[-1]
+    assert new_trace.bends[1][0] == trace.bends[1][0]
+    assert new_trace.bends[2][0] == trace.bends[2][0]
+    assert new_trace.bends[1][1] == new_trace.bends[2][1] == trace.bends[1][1] - 1
+    assert router._detailed_slide_segment(trace, blocker, 0, -1) is None
+    router._astar = lambda job, _bounds, _factor, hard=False, _history=None: (
+        target if job.id == 0 and not hard else None)
     router._detailed_astar = lambda job: (
-        None if job.id == 0 and 1 in router.routes else
-        target if job.id == 0 else clear_blocker)
+        target if job.id == 0 and not router._path_blockers(job, target) else None)
     router._straighten_routes = lambda **_kwargs: 0
     failed, _, _, dragged, cancelled = router._detailed_route({0})
     assert not cancelled and failed == set() and dragged == 1
-    assert router.routes[0] == target and router.routes[1] == clear_blocker
+    assert router.routes[0] == target and router.routes[1] != blocker
+    assert DetailedTrace.from_path(1, router.routes[1]).bends[0] == trace.bends[0]
+    assert DetailedTrace.from_path(1, router.routes[1]).bends[-1] == trace.bends[-1]
     assert router._conflicts()[0] == set()
 
 
@@ -586,10 +616,80 @@ def test_detailed_drag_rolls_back_when_blocker_cannot_be_rebuilt():
     router._commit(router.jobs[1], blocker)
     router._astar = lambda job, _bounds, _factor, hard=False, _history=None: (
         target if job.id == 0 and not hard else None)
-    router._detailed_astar = lambda job: target if job.id == 0 else None
+    router._detailed_astar = lambda job: None
     assert not router._detailed_drag_blockers(router.jobs[0])
     assert router.routes == {1: blocker}
     assert router.force_guides == {}
+
+
+def test_detailed_drag_search_includes_nearby_nonblocking_segment():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+        {'net': 'B', 'layer': 'TOP', 'width': 1,
+         'start': [8, -8], 'end': [12, -8]},
+    ]}
+    router = Autorouter(board, RouterConfig(grid_step=2, clearance=0,
+                        boundary_margin=20, iterations=1, force_iterations=0))
+    target = [router._cell((x, 0)) for x in range(0, 21, 2)]
+    nearby = []
+    for a, b in zip([(8, -8), (8, -4), (12, -4)],
+                    [(8, -4), (12, -4), (12, -8)]):
+        section = router._grid_line(router._cell(a), router._cell(b))
+        nearby.extend(section if not nearby else section[1:])
+    router._commit(router.jobs[1], nearby)
+    assert router._path_blockers(router.jobs[0], target) == set()
+    assert (1, 1) in router._detailed_nearby_segments(target, router.jobs[0])
+
+
+def test_detailed_slide_moves_only_triangle_hypotenuse():
+    points = [(0, 0), (0, 6), (6, 0), (10, 0)]
+    path = []
+    for a, b in zip(points, points[1:]):
+        section = Autorouter._grid_line(a, b)
+        path.extend(section if not path else section[1:])
+    trace = DetailedTrace.from_path(7, path)
+    moved = Autorouter._detailed_slide_segment(trace, path, 1, 1)
+    assert moved is not None
+    bends = DetailedTrace.from_path(7, moved).bends
+    assert bends == ((0, 0), (0, 8), (8, 0), (10, 0))
+    assert moved[0] == path[0] and moved[-1] == path[-1]
+    assert Autorouter._detailed_slide_segment(trace, path, 0, 1) is None
+
+
+def test_detailed_drag_search_combines_two_single_segment_moves():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [30, 0]},
+        {'net': 'B', 'layer': 'TOP', 'width': 1,
+         'start': [8, -8], 'end': [12, -8]},
+        {'net': 'C', 'layer': 'TOP', 'width': 1,
+         'start': [18, -8], 'end': [22, -8]},
+    ]}
+    router = Autorouter(board, RouterConfig(grid_step=2, clearance=0,
+                        boundary_margin=20, iterations=1, force_iterations=0))
+    target = router._grid_line(router._cell((0, 0)), router._cell((30, 0)))
+    originals = {}
+    for job_id, left, right in ((1, 8, 12), (2, 18, 22)):
+        blocker = []
+        points = [(left, -8), (left, 0), (right, 0), (right, -8)]
+        for a, b in zip(points, points[1:]):
+            section = router._grid_line(router._cell(a), router._cell(b))
+            blocker.extend(section if not blocker else section[1:])
+        originals[job_id] = blocker
+        router._commit(router.jobs[job_id], blocker)
+    router._astar = lambda job, _bounds, _factor, hard=False, _history=None: (
+        target if job.id == 0 and not hard else None)
+    router._detailed_astar = lambda job: (
+        target if job.id == 0 and not router._path_blockers(job, target) else None)
+    assert router._detailed_drag_blockers(router.jobs[0])
+    assert router.routes[0] == target
+    for job_id in (1, 2):
+        before = DetailedTrace.from_path(job_id, originals[job_id]).bends
+        after = DetailedTrace.from_path(job_id, router.routes[job_id]).bends
+        assert after[0] == before[0] and after[-1] == before[-1]
+        assert after[1][0] == before[1][0] and after[2][0] == before[2][0]
+    assert router._conflicts()[0] == set()
 
 
 def test_detailed_stage_receives_routes_rejected_by_detour_guard():

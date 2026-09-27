@@ -176,6 +176,158 @@ def test_multiple_board_tabs_preserve_document_and_view_state(qt_app):
     w.close()
 
 
+def test_manual_routing_mode_is_removed(qt_app):
+    from pcb_viewer.app import MainWindow
+    w = MainWindow()
+    assert [w.mode.itemText(index) for index in range(w.mode.count())] == [
+        'Select', 'Rectangle', 'Polygon']
+    assert not hasattr(w, 'route_net')
+    assert not hasattr(w, 'route_width')
+    w.close()
+
+
+def test_live_routing_preview_paints_and_rolls_back_without_edit(qt_app):
+    from pcb_viewer.app import MainWindow
+    from pcb_viewer.router import Autorouter, RouterConfig
+    w = MainWindow()
+    old_wire = {'net': 'A', 'layer': 'TOP', 'width': 1,
+                'route_type': 'autoroute', 'autoroute_job': 0,
+                'points': [[0, 0], [20, 0]]}
+    w.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+        {'net': 'B', 'layer': 'TOP', 'width': 1,
+         'start': [0, 10], 'end': [20, 10]},
+    ]
+    w.document.data['wires'] = [old_wire]
+    w.show_unrouted.setChecked(True)
+    w.refresh()
+    old_item = next(item for item in w.view.scene().items()
+                    if item.data(0) == ('wires', 0))
+    original = copy.deepcopy(w.document.data)
+    router = Autorouter(w.document.data, RouterConfig(
+        grid_step=2, clearance=0, boundary_margin=10, iterations=1))
+    w._begin_routing_preview()
+    assert not old_item.isVisible()
+    first = router._grid_line(router._cell((0, 0)), router._cell((20, 0)))
+    router._commit(router.jobs[0], first)
+    w._draw_routing_preview(router, 1, 1, 'Initial routing')
+    qt_app.processEvents()
+    assert len(w._routing_preview_items) == 1
+    assert len(w._routing_preview_airwires) == 1
+    assert '1 / 2 (preview)' == w.route_stat_labels['connections'].text()
+    router._remove(0)
+    w._draw_routing_preview(router, 1, 1, 'Routing complete')
+    assert not w._routing_preview_items
+    assert len(w._routing_preview_airwires) == 2
+    w._end_routing_preview()
+    assert old_item.isVisible()
+    assert not w._routing_preview_airwires
+    assert w.document.data == original and not w.document.dirty
+    w.close()
+
+
+def test_gui_autoroute_displays_live_preview_before_final_commit(qt_app, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QMessageBox, QSpinBox
+    from pcb_viewer.app import MainWindow
+    w = MainWindow()
+    w.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+        {'net': 'B', 'layer': 'TOP', 'width': 1,
+         'start': [0, 10], 'end': [20, 10]},
+    ]
+    w.refresh()
+    def accept(dialog):
+        rounds = [spin for spin in dialog.findChildren(QSpinBox)
+                  if spin.minimum() == 1 and spin.maximum() == 16]
+        assert len(rounds) == 1 and rounds[0].value() == 1
+        return 1
+
+    monkeypatch.setattr(QDialog, 'exec', accept)
+    monkeypatch.setattr(QMessageBox, 'information', lambda *_args: None)
+    monkeypatch.setattr(QMessageBox, 'question',
+                        lambda *_args: QMessageBox.StandardButton.Discard)
+    snapshots = []
+    original_draw = w._draw_routing_preview
+
+    def observe(router, round_number, total_rounds, message):
+        assert w._route_progress_bar is not None
+        assert w._route_progress_bar.parentWidget() is w.statusBar()
+        assert w._routing_in_progress and w.view.isEnabled()
+        assert not w.mode.isEnabled() and not w.tabs.isEnabled()
+        original_draw(router, round_number, total_rounds, message)
+        snapshots.append((len(router.routes), len(w.document.data.get('wires', [])),
+                          len(w._routing_preview_items)))
+
+    monkeypatch.setattr(w, '_draw_routing_preview', observe)
+    w.autoroute()
+    assert any(routed > 0 and committed == 0 and painted > 0
+               for routed, committed, painted in snapshots)
+    assert not w._routing_preview_items and not w._routing_preview_airwires
+    assert w._route_progress_bar is None
+    assert not w._routing_in_progress
+    assert w.mode.isEnabled() and w.tabs.isEnabled() and w.side_dock.isEnabled()
+    assert len(w.document.data['wires']) == 2
+    assert w.document.position == 1
+    w.close()
+
+
+def test_cancelled_gui_autoroute_restores_existing_copper(qt_app, monkeypatch):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QDialog
+    from pcb_viewer.app import MainWindow
+    w = MainWindow()
+    existing = {'net': 'A', 'layer': 'TOP', 'width': 1,
+                'route_type': 'autoroute', 'autoroute_job': 0,
+                'points': [[0, 0], [20, 0]]}
+    w.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+    ]
+    w.document.data['wires'] = [existing]
+    w.refresh()
+    old_item = next(item for item in w.view.scene().items()
+                    if item.data(0) == ('wires', 0))
+    def accept(_dialog):
+        QTimer.singleShot(0, lambda: w._route_cancel_button.click())
+        return 1
+
+    monkeypatch.setattr(QDialog, 'exec', accept)
+    w.autoroute()
+    assert w.document.data['wires'] == [existing]
+    assert not w.document.dirty
+    assert old_item.isVisible()
+    assert not w._routing_preview_items
+    assert w._route_cancel_button is None
+    assert not w._routing_in_progress
+    assert w.mode.isEnabled() and w.tabs.isEnabled() and w.side_dock.isEnabled()
+    w.close()
+
+
+def test_switching_tabs_clears_transient_routing_preview(qt_app):
+    from pcb_viewer.app import MainWindow
+    from pcb_viewer.router import Autorouter, RouterConfig
+    w = MainWindow()
+    w.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+    ]
+    router = Autorouter(w.document.data, RouterConfig(grid_step=2,
+                                                       boundary_margin=10))
+    w._begin_routing_preview()
+    router._commit(router.jobs[0], router._grid_line(
+        router._cell((0, 0)), router._cell((20, 0))))
+    w._draw_routing_preview(router, 1, 1, 'Initial routing')
+    assert w._routing_preview_items
+    w.new()
+    assert not w._routing_preview_items
+    assert w._routing_preview_document is None
+    assert not any('Provisional route:' in item.toolTip()
+                   for item in w.view.scene().items())
+    w.close()
+
+
 def test_unrouted_overlay_is_optional_and_follows_active_tab(qt_app):
     from pcb_viewer.app import MainWindow
     w = MainWindow()

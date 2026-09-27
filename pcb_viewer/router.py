@@ -18,6 +18,7 @@ from typing import Callable, Iterable
 Point = tuple[float, float]
 Cell = tuple[int, int]
 Progress = Callable[[int, int, str], bool | None]
+RoutePreview = Callable[["Autorouter", int, int, str], None]
 
 
 @dataclass
@@ -48,6 +49,7 @@ class RouterConfig:
     attraction_strength: float = 0.5
     max_detour_ratio: float = 3.0
     detailed_max_passes: int = 32
+    detailed_drag_states: int = 12
 
     def validate(self) -> None:
         if not math.isfinite(self.grid_step) or self.grid_step <= 0:
@@ -74,6 +76,8 @@ class RouterConfig:
             raise ValueError("Maximum detour ratio cannot be negative.")
         if not 0 <= self.detailed_max_passes <= 64:
             raise ValueError("Detailed-routing passes must be between 0 and 64.")
+        if not 0 <= self.detailed_drag_states <= 64:
+            raise ValueError("Detailed drag search states must be between 0 and 64.")
         if self.ordering not in ("short", "dense_first"):
             raise ValueError("Routing order must be short or dense_first.")
         if not isinstance(self.random_rounds, int) or not 1 <= self.random_rounds <= 16:
@@ -1523,96 +1527,184 @@ class Autorouter:
                 break
         return None
 
-    def _detailed_drag_guide(self, trace: DetailedTrace, target: list[Cell],
-                             offset: float, side: int) -> tuple[Point, ...]:
-        """Pull the segment nearest a missing connection into a parallel jog.
+    @staticmethod
+    def _detailed_slide_segment(trace: DetailedTrace, path: list[Cell],
+                                segment: int, offset: int) -> list[Cell] | None:
+        """Slide one interior segment parallel; keep its two neighbors on their lines.
 
-        Endpoints remain fixed.  The jog is only a soft guide; hard-obstacle
-        A* rebuilds the actual trace, so no copper is moved without DRC.
+        The two new bends are exact integer intersections of the translated
+        segment with the *original* neighboring support lines.  Neither the
+        preceding nor following segment can rotate or acquire an extra bend.
         """
-        bends = [self._point(cell) for cell in trace.bends]
-        if len(bends) < 2:
-            return tuple(bends)
-        target_points = [self._point(cell) for cell in target]
-        nearest: tuple[float, int, Point, Point] | None = None
-        for index, (a, b) in enumerate(zip(bends, bends[1:])):
-            for point in target_points:
-                foot = self._closest_point_on_segment(point, a, b)
-                score = math.dist(point, foot)
-                if nearest is None or score < nearest[0]:
-                    nearest = score, index, point, foot
-        assert nearest is not None
-        _, segment, target_point, foot = nearest
-        a, b = bends[segment], bends[segment + 1]
+        bends = trace.bends
+        if not offset or not 1 <= segment < len(bends) - 2:
+            return None
+        p, a, b, q = bends[segment - 1:segment + 3]
         dx, dy = b[0] - a[0], b[1] - a[1]
-        length = math.hypot(dx, dy)
-        if length < 1e-8:
-            return tuple(bends)
-        normal = -dy / length, dx / length
-        cross = dx * (target_point[1] - a[1]) - dy * (target_point[0] - a[0])
-        away = (-1 if cross > 1e-8 else 1) * side
-        normal = normal[0] * away * offset, normal[1] * away * offset
-        position = max(0.0, min(1.0, ((foot[0] - a[0]) * dx +
-                                       (foot[1] - a[1]) * dy) / (length * length)))
-        first = max(0.05, position - 0.25)
-        second = min(0.95, position + 0.25)
-        if second - first < 0.1:
-            first, second = 0.25, 0.75
-        jog = ((a[0] + first * dx + normal[0], a[1] + first * dy + normal[1]),
-               (a[0] + second * dx + normal[0], a[1] + second * dy + normal[1]))
-        return tuple(bends[:segment + 1]) + jog + tuple(bends[segment + 1:])
+        scale = math.gcd(abs(dx), abs(dy))
+        if not scale:
+            return None
+        direction = dx // scale, dy // scale
+        shifted = (a[0] - direction[1] * offset,
+                   a[1] + direction[0] * offset)
+
+        def intersection(start: Cell, end: Cell) -> Cell | None:
+            ux, uy = end[0] - start[0], end[1] - start[1]
+            determinant = ux * direction[1] - uy * direction[0]
+            if not determinant:
+                return None
+            vx, vy = shifted[0] - start[0], shifted[1] - start[1]
+            numerator = vx * direction[1] - vy * direction[0]
+            x_numerator = start[0] * determinant + ux * numerator
+            y_numerator = start[1] * determinant + uy * numerator
+            if x_numerator % determinant or y_numerator % determinant:
+                return None
+            return x_numerator // determinant, y_numerator // determinant
+
+        new_a = intersection(p, a)
+        new_b = intersection(b, q)
+        if new_a is None or new_b is None or new_a in (p, b) or new_b in (a, q):
+            return None
+        # Adjacent segments retain their direction and cannot reverse; the
+        # translated segment also retains the original positive direction.
+        if (not 0 < (new_a[0] - p[0]) * (a[0] - p[0]) +
+                (new_a[1] - p[1]) * (a[1] - p[1]) or
+                not 0 < (q[0] - new_b[0]) * (q[0] - b[0]) +
+                (q[1] - new_b[1]) * (q[1] - b[1]) or
+                not 0 < (new_b[0] - new_a[0]) * dx +
+                (new_b[1] - new_a[1]) * dy):
+            return None
+        if (new_b[0] - new_a[0]) * dy != (new_b[1] - new_a[1]) * dx:
+            return None
+        first, last = trace.bend_indices[segment - 1], trace.bend_indices[segment + 2]
+        replacement = (Autorouter._grid_line(p, new_a) +
+                       Autorouter._grid_line(new_a, new_b)[1:] +
+                       Autorouter._grid_line(new_b, q)[1:])
+        result = path[:first] + replacement + path[last + 1:]
+        return result if len(result) == len(set(result)) else None
+
+    def _detailed_nearby_segments(self, prospective: list[Cell],
+                                  target: RoutingJob) -> list[tuple[int, int]]:
+        """Rank both direct blockers and non-conflicting neighbors of the airwire."""
+        samples = [self._point(cell) for cell in
+                   prospective[::max(1, len(prospective) // 32)]]
+        if prospective and self._point(prospective[-1]) not in samples:
+            samples.append(self._point(prospective[-1]))
+        blockers = self._path_blockers(target, prospective)
+        nearby = []
+        for other_id, path in self.routes.items():
+            other = self.jobs_by_id[other_id]
+            if other.net == target.net:
+                continue
+            trace = DetailedTrace.from_path(other_id, path)
+            for segment in range(1, len(trace.bends) - 2):
+                a, b = (self._point(cell) for cell in trace.segments[segment])
+                distance = min(self._distance_to_segment(x, y, a, b)
+                               for x, y in samples)
+                reach = ((target.width + other.width) / 2 + self.clearance +
+                         8 * self.step)
+                if other_id in blockers or distance <= reach:
+                    nearby.append((0 if other_id in blockers else 1,
+                                   distance, other_id, segment))
+        nearby.sort()
+        # Several traces and two bend segments per trace may participate.
+        result, counts = [], {}
+        for _, _, other_id, segment in nearby:
+            if counts.get(other_id, 0) >= 2:
+                continue
+            counts[other_id] = counts.get(other_id, 0) + 1
+            result.append((other_id, segment))
+            if len(result) >= 16:
+                break
+        return result
+
+    def _detailed_slide_legal(self, other: RoutingJob, path: list[Cell]) -> bool:
+        if self._excessive_detour(other, path):
+            return False
+        for index, cell in enumerate(path):
+            if not self._static_legal(cell, other, index in (0, len(path) - 1)):
+                return False
+            if self._dynamic_context(cell, other)[0]:
+                return False
+            if index and self._diagonal_blockers(path[index - 1], cell, other):
+                return False
+        return True
 
     def _detailed_drag_blockers(self, job: RoutingJob) -> bool:
-        """Make room for a missing connection by dragging its actual blockers.
-
-        This is a transaction: target and every displaced trace must be rebuilt
-        with hard-obstacle A*, or the complete prior board is restored.
-        """
-        if not self.config.max_shove_blockers:
+        """Bounded best-first search over legal one-segment slides near a miss."""
+        if not self.config.max_shove_blockers or not self.config.detailed_drag_states:
             return False
         whole = (0, self.cols - 1, 0, self.rows - 1)
         prospective = self._astar(job, whole, self.config.present_congestion_cost,
                                   False, 0.0)
         if prospective is None:
             return False
-        blockers = self._path_blockers(job, prospective)
-        if not 0 < len(blockers) <= self.config.max_shove_blockers:
+        candidates = self._detailed_nearby_segments(prospective, job)
+        if not candidates:
             return False
         snapshot = {job_id: list(path) for job_id, path in self.routes.items()}
-        traces = {other_id: DetailedTrace.from_path(other_id, snapshot[other_id])
-                  for other_id in blockers}
-        for other_id in blockers:
-            self._remove(other_id)
-        path = self._detailed_astar(job)
-        if path is None:
-            self._restore_routes(snapshot)
-            return False
-        self._commit(job, path)
-        for other_id in sorted(blockers):
-            other = self.jobs_by_id[other_id]
-            offset = (job.width + other.width) / 2 + self.clearance + 2 * self.step
-            rebuilt = None
-            for side in (1, -1):
-                self.force_guides[other_id] = self._detailed_drag_guide(
-                    traces[other_id], path, offset, side)
-                try:
-                    rebuilt = self._detailed_astar(other)
-                finally:
-                    self.force_guides.pop(other_id, None)
-                if rebuilt is not None:
-                    break
-            if rebuilt is None:
-                rebuilt = self._detailed_astar(other)
-            if rebuilt is None:
+        queue = [(len(self._path_blockers(job, prospective)), 0, 0, snapshot, frozenset())]
+        seen = {()}
+        serial = 0
+        explored = 0
+        try:
+            while queue and explored < self.config.detailed_drag_states:
+                _, depth, _, state, moved = heapq.heappop(queue)
+                self._restore_routes(state)
+                if depth:
+                    explored += 1
+                    path = self._detailed_astar(job)
+                    if path is not None:
+                        self._commit(job, path)
+                        if (not self._conflicts()[0] and
+                                not self._geometric_crossings(self._unique_wire_runs())):
+                            return True
+                        self._remove(job.id)
+                if depth >= min(3, self.config.max_shove_blockers):
+                    continue
+                generated = 0
+                for offset in (-1, 1, -2, 2, -3, 3, -4, 4):
+                    for other_id, segment in candidates:
+                        if other_id in moved:
+                            continue
+                        other = self.jobs_by_id[other_id]
+                        old_path = self.routes[other_id]
+                        trace = DetailedTrace.from_path(other_id, old_path)
+                        if segment >= len(trace.bends) - 2:
+                            continue
+                        candidate = self._detailed_slide_segment(trace, old_path,
+                                                                 segment, offset)
+                        if candidate is None:
+                            continue
+                        self._remove(other_id)
+                        legal = self._detailed_slide_legal(other, candidate)
+                        if legal:
+                            self._commit(other, candidate)
+                            next_state = dict(state)
+                            next_state[other_id] = candidate
+                            signature = tuple((item, tuple(next_state[item]))
+                                              for item in sorted(moved | {other_id}))
+                            if signature not in seen:
+                                seen.add(signature)
+                                blockers = len(self._path_blockers(job, prospective))
+                                serial += 1
+                                heapq.heappush(queue, (blockers, depth + 1, serial,
+                                                       next_state, moved | {other_id}))
+                                generated += 1
+                            self._remove(other_id)
+                        self._commit(other, old_path)
+                        if generated >= 48:
+                            break
+                    if generated >= 48:
+                        break
+                # Limit frontier memory as well as the number of expensive A* calls.
+                if len(queue) > self.config.detailed_drag_states * 4:
+                    queue = heapq.nsmallest(self.config.detailed_drag_states * 4, queue)
+                    heapq.heapify(queue)
+        finally:
+            if job.id not in self.routes:
                 self._restore_routes(snapshot)
-                return False
-            self._commit(other, rebuilt)
-        if (set(self.routes) != set(snapshot) | {job.id} or
-                self._conflicts()[0] or
-                self._geometric_crossings(self._unique_wire_runs())):
-            self._restore_routes(snapshot)
-            return False
-        return True
+        return False
 
     def _detailed_route(self, failed: set[int], progress: Progress | None = None
                         ) -> tuple[set[int], int, int, int, bool]:
@@ -1800,13 +1892,16 @@ class Autorouter:
             )]
         return ordered
 
-    def route(self, progress: Progress | None = None) -> tuple[list[dict], RouteReport]:
+    def route(self, progress: Progress | None = None,
+              preview: RoutePreview | None = None) -> tuple[list[dict], RouteReport]:
         started = time.monotonic()
         report = RouteReport(self.layer, len(self.jobs),
                              config={"backend": "builtin", **asdict(self.config)})
         ordered = self._initial_order()
 
         def update(done: int, message: str) -> bool:
+            if preview is not None:
+                preview(self, done, len(self.jobs), message)
             if progress is None:
                 return True
             return progress(done, len(self.jobs), message) is not False
@@ -1964,7 +2059,8 @@ class Autorouter:
 
 
 def autoroute_data(data: dict, config: RouterConfig | None = None,
-                   progress: Progress | None = None) -> tuple[list[dict], RouteReport]:
+                   progress: Progress | None = None,
+                   preview: RoutePreview | None = None) -> tuple[list[dict], RouteReport]:
     """Try a baseline and seeded order permutations; retain the best legal result."""
     config = config or RouterConfig()
     config.validate()
@@ -1985,7 +2081,13 @@ def autoroute_data(data: dict, config: RouterConfig | None = None,
             return progress(round_index * total + highest_progress,
                             config.random_rounds * total,
                             f'Round {round_index + 1}/{config.random_rounds}: {message}')
-        wires, report = router.route(round_progress)
+        if preview is None:
+            wires, report = router.route(round_progress)
+        else:
+            def round_preview(active: Autorouter, _done: int, _total: int,
+                              message: str) -> None:
+                preview(active, round_index + 1, config.random_rounds, message)
+            wires, report = router.route(round_progress, round_preview)
         results.append({'round': round_index + 1, 'seed': seed, 'routed': report.routed,
                         'jobs_total': report.jobs_total, 'conflict_cells': report.conflict_cells,
                         'wire_length': report.wire_length,
