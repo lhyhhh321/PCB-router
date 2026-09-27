@@ -42,9 +42,27 @@ def main():
     parser.add_argument('--output', help='Autorouter output JSON (default: INPUT-routed.json)')
     parser.add_argument('--grid', type=float, default=2.0, help='Autorouter grid spacing (default: 2.0)')
     parser.add_argument('--clearance', type=float, help='Override metadata design-rule clearance')
-    parser.add_argument('--iterations', type=int, default=6, help='Search-and-repair passes (default: 6)')
+    parser.add_argument('--iterations', type=int, default=6,
+                        help='Initial congestion-repair passes (default: 6)')
+    parser.add_argument('--early-refine-interval', type=int, default=192,
+                        help='Refine/rip up after each N initial jobs (0 disables; default: 192)')
+    parser.add_argument('--force-iterations', '--combined-iterations',
+                        dest='force_iterations', type=int, default=6,
+                        help='Combined straighten/repair/balance iterations (0 disables; default: 6)')
+    parser.add_argument('--force-max-jobs', type=int, default=12,
+                        help='Maximum movable routes per force round (default: 12)')
+    parser.add_argument('--detailed-max-passes', type=int, default=32,
+                        help='Detailed straighten/drag passes (0 disables; default: 32)')
+    parser.add_argument('--attraction-strength', type=float, default=0.5,
+                        help='Inter-net spacing attraction (0 disables; default: 0.5)')
+    parser.add_argument('--max-detour-ratio', type=float, default=3.0,
+                        help='Reject extreme route stretch after repair (0 disables; default: 3)')
     parser.add_argument('--ordering', choices=('dense_first', 'short'), default='dense_first',
                         help='Built-in route priority (default: dense_first)')
+    parser.add_argument('--random-rounds', type=int, default=3,
+                        help='Built-in order trials including baseline (default: 3; 1 disables randomized trials)')
+    parser.add_argument('--random-seed', type=int, default=0,
+                        help='Reproducible seed for built-in randomized trials (default: 0)')
     parser.add_argument('--algorithm', choices=('builtin', 'freerouting'), default='builtin',
                         help='Auto routing backend (default: builtin)')
     parser.add_argument('--freerouting-jar', help='Freerouting JAR path (or set FREEROUTING_JAR)')
@@ -65,7 +83,15 @@ def main():
             document.data['wires'] = [wire for wire in document.data.get('wires', [])
                                       if wire.get('route_type') != 'autoroute']
             config = RouterConfig(grid_step=args.grid, clearance=args.clearance,
-                                  iterations=args.iterations, ordering=args.ordering)
+                                  iterations=args.iterations, ordering=args.ordering,
+                                  early_refine_interval=args.early_refine_interval,
+                                  force_iterations=args.force_iterations,
+                                  force_max_jobs=args.force_max_jobs,
+                                  detailed_max_passes=args.detailed_max_passes,
+                                  attraction_strength=args.attraction_strength,
+                                  max_detour_ratio=args.max_detour_ratio,
+                                  random_rounds=args.random_rounds,
+                                  random_seed=args.random_seed)
             last_notice = [0.0]
             def progress(done, total, message):
                 now = time.monotonic()

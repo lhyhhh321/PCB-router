@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from pcb_viewer.model import Document, polygon
 
-SAMPLES = list(Path('pcb_example').glob('*.json'))
+SAMPLES = [Path('pcb_example') / name for name in (
+    '01全板.json',
+    '02第三层右侧并删去地线参考.json',
+    '03第三层右侧删去线网（布线输入）.json',
+    'DEMO_0511_1810-init_full_board.json',
+)]
 
 @pytest.mark.parametrize('sample', SAMPLES, ids=lambda p:p.name)
 def test_roundtrip(sample, tmp_path):
@@ -188,4 +193,64 @@ def test_unrouted_overlay_is_optional_and_follows_active_tab(qt_app):
                                  'points': [[0, 0], [20, 0]]}]
     w.refresh()
     assert not any('Unrouted: N1' in item.toolTip() for item in w.view.scene().items())
+    w.close()
+
+
+def test_auto_route_statistics_distinguish_nets_from_connections():
+    from pcb_viewer.app import auto_route_statistics
+    data = {
+        'routing_connections': [
+            {'net': 'A', 'layer': 'TOP', 'start': [0, 0], 'end': [10, 0]},
+            {'net': 'A', 'layer': 'TOP', 'start': [10, 0], 'end': [20, 0]},
+            {'net': 'B', 'layer': 'TOP', 'start': [0, 10], 'end': [10, 10]},
+        ],
+        'wires': [
+            {'net': 'A', 'layer': 'TOP', 'route_type': 'autoroute',
+             'autoroute_jobs': [0, 0], 'points': [[0, 0], [10, 0]]},
+            {'net': 'B', 'layer': 'TOP', 'route_type': 'autoroute',
+             'autoroute_job': 2, 'points': [[0, 10], [10, 10]]},
+            {'net': 'OTHER', 'layer': 'TOP', 'route_type': 'autoroute',
+             'autoroute_job': 1, 'points': [[0, 20], [10, 20]]},
+        ],
+    }
+    assert auto_route_statistics(data) == {
+        'nets_total': 2, 'nets_routed': 1, 'nets_partial': 1,
+        'connections_total': 3, 'connections_routed': 2, 'wire_length': 30.0,
+    }
+
+
+def test_auto_route_sidebar_tracks_tabs_and_undo(qt_app):
+    from pcb_viewer.app import MainWindow
+    w = MainWindow()
+    w.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'start': [0, 0], 'end': [10, 0]},
+        {'net': 'A', 'layer': 'TOP', 'start': [10, 0], 'end': [20, 0]},
+    ]
+    w.refresh()
+    labels = w.route_stat_labels
+    assert labels['nets_routed'].text() == '0'
+    assert labels['nets_total'].text() == '1'
+    assert labels['connections'].text() == '0 / 2'
+    wire = {'net': 'A', 'layer': 'TOP', 'width': 2, 'route_type': 'autoroute',
+            'autoroute_job': 0, 'points': [[0, 0], [10, 0]]}
+    w.document.batch_change([('wires', 0, wire)])
+    w.refresh()
+    assert labels['nets_routed'].text() == '0'
+    assert labels['nets_total'].text() == '1'
+    assert labels['partial'].text() == '1'
+    assert labels['connections'].text() == '1 / 2'
+    assert labels['unrouted'].text() == '1'
+    assert labels['completion'].text() == '50.0%'
+    assert labels['length'].text() == '10.0 units'
+    w.new()
+    assert labels['nets_routed'].text() == '0'
+    assert labels['nets_total'].text() == '0'
+    assert labels['completion'].text() == '—'
+    w.tabs.setCurrentIndex(0)
+    assert labels['connections'].text() == '1 / 2'
+    w.history(False)
+    assert labels['connections'].text() == '0 / 2'
+    w.history(True)
+    assert labels['connections'].text() == '1 / 2'
+    w.document.saved_position = w.document.position
     w.close()
