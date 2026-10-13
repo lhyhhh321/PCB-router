@@ -889,10 +889,7 @@ class MainWindow(QMainWindow):
         detour_row.addWidget(max_detour_ratio)
         layout.addLayout(detour_row)
         algorithm.currentIndexChanged.connect(lambda index: (
-<<<<<<< HEAD
-=======
             stage_button.setEnabled(index == 0),
->>>>>>> 89f1990 (Add torch acceleration for cost calculations.)
             compute_backend.setEnabled(index == 0),
             rounds_label.setEnabled(index == 0),
             random_rounds.setEnabled(index == 0),

@@ -64,10 +64,6 @@ class RouterConfig:
     detailed_max_passes: int = 32
     detailed_drag_states: int = 12
     compute_backend: str = "python"
-<<<<<<< HEAD
-
-    def validate(self) -> None:
-=======
     stages: tuple[str, ...] | None = None
 
     def stage_enabled(self, stage: str) -> bool:
@@ -82,7 +78,6 @@ class RouterConfig:
                                  ", ".join(ROUTING_STAGES))
             if len(set(self.stages)) != len(self.stages):
                 raise ValueError("Routing stages cannot contain duplicates.")
->>>>>>> 89f1990 (Add torch acceleration for cost calculations.)
         if self.compute_backend not in ("python", "torch-cpu", "torch-mps", "torch-cuda", "torch-auto"):
             raise ValueError("Unknown routing compute backend.")
         if not math.isfinite(self.grid_step) or self.grid_step <= 0:
