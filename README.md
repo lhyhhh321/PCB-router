@@ -83,6 +83,39 @@ The command writes an `autoroute_report` into the output. The built-in router's 
 
 This is currently a single-layer research router: it does not insert vias, tune differential pairs, enforce length/impedance constraints, or replace a PCB manufacturer's final DRC. See [ROUTER_DESIGN.md](ROUTER_DESIGN.md) for the data contract, cost model, implementation stages, and limitations.
 
+## Optional PyTorch acceleration
+
+Install `python -m pip install -r requirements-torch.txt`, then select a
+**Congestion calculation** backend in the Auto route dialog, or run:
+
+```bash
+python -m pcb_viewer "pcb_example/03第三层右侧删去线网（布线输入）.json" \
+  --autoroute --compute-backend torch-cpu --output /tmp/pcb-routed.json
+```
+
+Backends are `python` (unchanged default), `torch-cpu`, `torch-mps` (Apple GPU),
+`torch-cuda` (NVIDIA GPU), and `torch-auto` (CUDA, then MPS, then CPU).
+Auto chooses an available device, not the fastest measured device. GPU setup
+and transfers can outweigh parallelism on small searches; compare backends
+on your board using [the benchmark script](benchmarks/README.md).
+On the supplied full file-03 board (Apple M5), Python took 724.9 seconds,
+PyTorch CPU 416.2 seconds (1.74× faster), and MPS 433.7 seconds (1.67× faster).
+All three emitted exactly the same wires: 204/220 connections, zero reported
+conflicts. These are single full runs; see the benchmark results for details.
+
+An explicitly requested unavailable GPU produces an actionable error.
+PyTorch is optional and is not imported by the default Python backend.
+
+PyTorch batches clearance-based congestion counts and historical costs for
+larger A* searches. The priority queue, search ordering, cost formula, force
+refinement, route repair, and final checks retain their existing behavior.
+Calculations use integer tensor operations on CPU/GPU; results transfer back
+once per field, rather than once per grid expansion. Small searches and
+oversized or numerically ambiguous fields use the original scalar checks.
+The report records `config.compute_device`, `accelerated_searches`, and
+`acceleration_fallbacks`. CUDA is supported but requires validation on CUDA
+hardware; local differential tests exercise CPU and Apple MPS when available.
+
 ## Route keepout masks
 
 1. Choose **Place keepouts on layer**, and choose `wire_keepout` (routing mask) or `via_keepout`.

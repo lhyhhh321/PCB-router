@@ -111,3 +111,31 @@ Randomized-order trials were tested against that same file-03 input before the s
 - Dense boards should eventually use tiled workers and localized DRC markers, closer to TritonRoute's scalable worker model.
 
 Always inspect status-2 results and run the target CAD/fabrication DRC before manufacturing.
+
+## Optional parallel congestion fields
+
+`RouterConfig.compute_backend` selects an optional PyTorch engine implemented
+in `pcb_viewer/torch_costs.py`. After 256 expansions in an A* invocation, the
+engine snapshots its search rectangle and computes dynamic cell costs in
+batches. Each foreign route has a Boolean clearance footprint, using the same
+width-dependent offsets and strict clearance predicate as `_dynamic_context`.
+Reducing these footprints counts distinct route IDs (not nearby cells and not
+nets). Same-net routes are excluded. Sparse history is accumulated with integer
+scatter-add using the original, wider history stencil. Diagonal crossings
+remain a separate edge check in A*. Static geometry and exact endpoint access
+retain the scalar implementation.
+
+Routes are grouped by width and packed into parallel tensor operations. Route
+batches limit footprint storage to 32 million Boolean entries; broadcasts are
+chunked, and search rectangles exceeding one million cells use scalar checks.
+The numerical guard also falls back when floating coordinate subtraction
+could affect a clearance-boundary decision. Tensor fields live only for one
+A* call, so commits, removals, rollbacks and history changes require no cache
+invalidation protocol. Counts and history return as host integer lists; A*
+performs no per-cell device synchronization. PyTorch CPU uses its native
+threaded kernels; CUDA and MPS execute those tensor operations on the GPU.
+No route order, stopping criterion, heuristic or legalization rule changes.
+
+See [benchmarks/README.md](benchmarks/README.md) for profiling evidence and
+reproduction. Accelerating independent randomized trials with processes is
+possible future work, but is separate from this tensor backend.

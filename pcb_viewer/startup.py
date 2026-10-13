@@ -63,6 +63,8 @@ def main():
                         help='Built-in route priority (default: dense_first)')
     parser.add_argument('--random-rounds', type=int, default=1,
                         help='Built-in order trials including baseline (default: 1; increase for randomized trials)')
+    parser.add_argument('--compute-backend', choices=('python', 'torch-auto', 'torch-cpu', 'torch-mps', 'torch-cuda'),
+                        default='python', help='Congestion calculation backend (default: python)')
     parser.add_argument('--random-seed', type=int, default=0,
                         help='Reproducible seed for built-in randomized trials (default: 0)')
     parser.add_argument('--algorithm', choices=('builtin', 'freerouting'), default='builtin',
@@ -94,7 +96,8 @@ def main():
                                   attraction_strength=args.attraction_strength,
                                   max_detour_ratio=args.max_detour_ratio,
                                   random_rounds=args.random_rounds,
-                                  random_seed=args.random_seed)
+                                  random_seed=args.random_seed,
+                                  compute_backend=args.compute_backend)
             last_notice = [0.0]
             def progress(done, total, message):
                 now = time.monotonic()

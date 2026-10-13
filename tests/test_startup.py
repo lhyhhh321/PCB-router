@@ -25,3 +25,16 @@ def test_headless_help_never_initializes_qt():
 def test_offscreen_is_explicitly_supported(monkeypatch):
     monkeypatch.setenv('QT_QPA_PLATFORM', 'offscreen')
     assert desktop_error() is None
+
+
+def test_default_router_does_not_import_optional_torch():
+    code = """
+import sys
+from pcb_viewer.router import Autorouter
+Autorouter({'routing_connections': [
+    {'net': 'A', 'layer': 'TOP', 'start': [0, 0], 'end': [10, 0]}
+]})
+assert 'torch' not in sys.modules
+"""
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

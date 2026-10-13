@@ -50,8 +50,11 @@ class RouterConfig:
     max_detour_ratio: float = 3.0
     detailed_max_passes: int = 32
     detailed_drag_states: int = 12
+    compute_backend: str = "python"
 
     def validate(self) -> None:
+        if self.compute_backend not in ("python", "torch-cpu", "torch-mps", "torch-cuda", "torch-auto"):
+            raise ValueError("Unknown routing compute backend.")
         if not math.isfinite(self.grid_step) or self.grid_step <= 0:
             raise ValueError("Routing grid step must be positive.")
         if self.clearance is not None and (not math.isfinite(self.clearance) or self.clearance < 0):
@@ -153,6 +156,8 @@ class RouteReport:
     detailed_straightened: int = 0
     detailed_dragged: int = 0
     detailed_new_connections: int = 0
+    accelerated_searches: int = 0
+    acceleration_fallbacks: int = 0
     selected_round: int = 1
     round_results: list[dict] = field(default_factory=list)
 
@@ -238,6 +243,10 @@ class Autorouter:
         self.data = data
         self.config = config or RouterConfig()
         self.config.validate()
+        self.torch_costs = None
+        if self.config.compute_backend != "python":
+            from .torch_costs import TorchCosts
+            self.torch_costs = TorchCosts(self.config.compute_backend.removeprefix("torch-"))
         self.order_seed = order_seed
         self.jobs = extract_jobs(data, self.config.layer)
         if not self.jobs:
@@ -512,6 +521,7 @@ class Autorouter:
         queue = [(self._heuristic(start, goal), next(counter), 0.0, start, -1)]
         expansions = 0
         found = False
+        fields = None
         while queue and expansions < self.config.max_expansions:
             _, _, cost, cell, old_direction = heapq.heappop(queue)
             if cost != best.get(cell) or old_direction != incoming.get(cell):
@@ -520,6 +530,9 @@ class Autorouter:
                 found = True
                 break
             expansions += 1
+            # Small searches stay scalar; amortize tensor setup on larger ones.
+            if expansions == 256 and self.torch_costs is not None:
+                fields = self.torch_costs.build(self, job, bounds)
             for direction, (dx, dy) in enumerate(self.DIRECTIONS):
                 if old_direction >= 0 and direction == (old_direction + 4) % 8:
                     continue
@@ -536,7 +549,11 @@ class Autorouter:
                 bend = self.config.bend_penalty if old_direction >= 0 and old_direction != direction else 0.0
                 dynamic_parts = dynamic_cache.get(nxt)
                 if dynamic_parts is None:
-                    dynamic_parts = self._dynamic_cost_parts(nxt, job)
+                    if fields is None:
+                        dynamic_parts = self._dynamic_cost_parts(nxt, job)
+                    else:
+                        index = (nxt[1] - y1) * (x2 - x1 + 1) + nxt[0] - x1
+                        dynamic_parts = fields[0][index], fields[1][index]
                     dynamic_cache[nxt] = dynamic_parts
                 conflicts, historical = dynamic_parts
                 conflicts += len(self._diagonal_blockers(cell, nxt, job))
@@ -1897,6 +1914,7 @@ class Autorouter:
         started = time.monotonic()
         report = RouteReport(self.layer, len(self.jobs),
                              config={"backend": "builtin", **asdict(self.config)})
+        report.config["compute_device"] = self.torch_costs.device if self.torch_costs else "python"
         ordered = self._initial_order()
 
         def update(done: int, message: str) -> bool:
@@ -2047,6 +2065,9 @@ class Autorouter:
             math.dist(a, b) for wire in wires
             for a, b in zip(wire['points'], wire['points'][1:])
         )
+        if self.torch_costs is not None:
+            report.accelerated_searches = self.torch_costs.fields_built
+            report.acceleration_fallbacks = self.torch_costs.fields_skipped
         report.routed = len(self.routes)
         reasons = {entry['job']: entry['reason'] for entry in report.failed}
         report.failed = [{"job": job.id, "net": job.net,

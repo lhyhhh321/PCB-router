@@ -725,6 +725,13 @@ class MainWindow(QMainWindow):
         ordering = QComboBox()
         ordering.addItems(['Higher completion (dense areas first)', 'Faster (short routes first)'])
         layout.addWidget(ordering)
+        layout.addWidget(QLabel("Congestion calculation"))
+        compute_backend = QComboBox()
+        for label, value in [("Python (default)", "python"), ("PyTorch automatic device", "torch-auto"),
+                             ("PyTorch CPU", "torch-cpu"), ("PyTorch Apple GPU (MPS)", "torch-mps"),
+                             ("PyTorch NVIDIA GPU (CUDA)", "torch-cuda")]:
+            compute_backend.addItem(label, value)
+        layout.addWidget(compute_backend)
         rounds_row = QHBoxLayout()
         rounds_label = QLabel('Routing-order trials (first uses baseline order)')
         rounds_row.addWidget(rounds_label)
@@ -837,6 +844,7 @@ class MainWindow(QMainWindow):
         detour_row.addWidget(max_detour_ratio)
         layout.addLayout(detour_row)
         algorithm.currentIndexChanged.connect(lambda index: (
+            compute_backend.setEnabled(index == 0),
             rounds_label.setEnabled(index == 0),
             random_rounds.setEnabled(index == 0),
             seed_label.setEnabled(index == 0),
@@ -886,6 +894,7 @@ class MainWindow(QMainWindow):
                               max_detour_ratio=max_detour_ratio.value(),
                               random_rounds=random_rounds.value(),
                               random_seed=random_seed.value(),
+                              compute_backend=compute_backend.currentData(),
                               ordering='dense_first' if ordering.currentIndex() == 0 else 'short',
                               layer=self.visible_layer.currentText()
                               if self.visible_layer.currentText() != 'All layers' else None)
