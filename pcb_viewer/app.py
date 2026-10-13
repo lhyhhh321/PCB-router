@@ -15,9 +15,43 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraph
     QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressBar, QTabBar,
     QSizePolicy, QHBoxLayout, QGroupBox, QFormLayout)
 from .model import Document, COLLECTIONS
-from .router import extract_jobs
+from .router import ROUTING_STAGES, extract_jobs
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
+
+
+class RoutingStagesDialog(QDialog):
+    """Edit a per-run pipeline selection without changing the parent on Cancel."""
+
+    def __init__(self, stages, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Built-in routing stages')
+        layout = QVBoxLayout(self)
+        note = QLabel('Selected stages run in the fixed pipeline order. Early refinement '
+                      'requires initial routing. Final conflict checks always run.')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.checks = {}
+        for stage, label in ROUTING_STAGES.items():
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(stage in stages)
+            self.checks[stage] = checkbox
+            layout.addWidget(checkbox)
+        controls = QHBoxLayout()
+        for label, checked in [('Select all', True), ('Clear all', False)]:
+            button = QPushButton(label)
+            button.clicked.connect(lambda _clicked=False, value=checked:
+                                   [check.setChecked(value) for check in self.checks.values()])
+            controls.addWidget(button)
+        layout.addLayout(controls)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_stages(self):
+        return tuple(stage for stage, check in self.checks.items() if check.isChecked())
 
 
 def auto_route_statistics(data):
@@ -721,6 +755,17 @@ class MainWindow(QMainWindow):
         algorithm = QComboBox()
         algorithm.addItems(['Built-in (TritonRoute-inspired)', 'Freerouting benchmark'])
         layout.addWidget(algorithm)
+        selected_stages = tuple(ROUTING_STAGES)
+        stage_button = QPushButton('Routing stages: all selected…')
+        stage_button.setObjectName('routing_stages')
+        def choose_stages():
+            nonlocal selected_stages
+            selector = RoutingStagesDialog(selected_stages, dialog)
+            if selector.exec():
+                selected_stages = selector.selected_stages()
+                stage_button.setText(f'Routing stages: {len(selected_stages)}/{len(ROUTING_STAGES)} selected…')
+        stage_button.clicked.connect(choose_stages)
+        layout.addWidget(stage_button)
         layout.addWidget(QLabel('Built-in routing priority'))
         ordering = QComboBox()
         ordering.addItems(['Higher completion (dense areas first)', 'Faster (short routes first)'])
@@ -844,6 +889,10 @@ class MainWindow(QMainWindow):
         detour_row.addWidget(max_detour_ratio)
         layout.addLayout(detour_row)
         algorithm.currentIndexChanged.connect(lambda index: (
+<<<<<<< HEAD
+=======
+            stage_button.setEnabled(index == 0),
+>>>>>>> 89f1990 (Add torch acceleration for cost calculations.)
             compute_backend.setEnabled(index == 0),
             rounds_label.setEnabled(index == 0),
             random_rounds.setEnabled(index == 0),
@@ -866,7 +915,7 @@ class MainWindow(QMainWindow):
         freerouting_minutes.setRange(1, 240)
         freerouting_minutes.setValue(10)
         layout.addWidget(freerouting_minutes)
-        note = QLabel('Only the open JSON board is used. Deleted trace interiors are ignored. Each built-in order trial runs the full repair/refinement pipeline, so multiple trials can take several times longer. The Freerouting benchmark runs an external JAR through a temporary single-layer DSN; non-terminal copper is conservatively fixed as obstacles.')
+        note = QLabel('Only the open JSON board is used. Deleted trace interiors are ignored. Each built-in order trial runs the selected stages, so multiple trials can take several times longer. The Freerouting benchmark runs an external JAR through a temporary single-layer DSN; non-terminal copper is conservatively fixed as obstacles.')
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -883,7 +932,8 @@ class MainWindow(QMainWindow):
         benchmark_input = hashlib.sha256(json.dumps(
             scratch, sort_keys=True, ensure_ascii=False,
             separators=(',', ':')).encode('utf-8')).hexdigest()
-        config = RouterConfig(grid_step=fields['Grid spacing'].value(),
+        config = RouterConfig(stages=selected_stages,
+                              grid_step=fields['Grid spacing'].value(),
                               clearance=fields['Clearance'].value(),
                               iterations=iterations.value(),
                               early_refine_interval=early_interval.value(),
@@ -1006,6 +1056,15 @@ class MainWindow(QMainWindow):
                   f'{len(report.failed)} unrouted connections.\n\n'
                   'Generated traces are one undoable edit. Review and run final fabrication DRC before use.')
         if not use_freerouting:
+            detail += '\nSelected stages: ' + (', '.join(report.config.get('enabled_stages', [])) or 'none')
+            if report.stage_results:
+                detail += '\nStage results (selected trial; initial includes checkpoints):'
+                for result in report.stage_results:
+                    detail += (f'\n  {result["stage"]}: {result["elapsed_seconds"]:.3f}s, '
+                               f'{result["before"]["routed"]} → {result["after"]["routed"]} connected, '
+                               f'{result["before"]["wire_length"]:.1f} → '
+                               f'{result["after"]["wire_length"]:.1f} length, '
+                               f'{result["after"]["conflict_cells"]} conflicts')
             detail += (f'\nEarly refinement: {report.early_refinement_passes} checkpoints, '
                        f'{report.early_refinement_moves} accepted moves.'
                        f'\nCombined straighten/repair/balance: {report.force_iterations_run} iterations, '

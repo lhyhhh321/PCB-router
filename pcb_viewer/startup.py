@@ -42,6 +42,10 @@ def main():
     parser.add_argument('--output', help='Autorouter output JSON (default: INPUT-routed.json)')
     parser.add_argument('--grid', type=float, default=2.0, help='Autorouter grid spacing (default: 2.0)')
     parser.add_argument('--clearance', type=float, help='Override metadata design-rule clearance')
+    from .router import ROUTING_STAGES
+    parser.add_argument('--stages', nargs='*', choices=tuple(ROUTING_STAGES),
+                        help='Built-in stages to include, in fixed pipeline order (default: all; '
+                             'an empty list runs validation only)')
     parser.add_argument('--iterations', type=int, default=6,
                         help='Initial congestion-repair passes (default: 6)')
     parser.add_argument('--early-refine-interval', type=int, default=192,
@@ -74,6 +78,8 @@ def main():
     parser.add_argument('--freerouting-timeout', type=float, default=600,
                         help='External router time limit in seconds (default: 600)')
     args = parser.parse_args()
+    if args.stages is not None and (not args.autoroute or args.algorithm != 'builtin'):
+        parser.error('--stages requires --autoroute --algorithm builtin')
     if args.autoroute:
         if not args.file or not Path(args.file).is_file():
             print(f'File not found: {args.file or "(missing input)"}', file=sys.stderr)
@@ -87,6 +93,7 @@ def main():
             document.data['wires'] = [wire for wire in document.data.get('wires', [])
                                       if wire.get('route_type') != 'autoroute']
             config = RouterConfig(grid_step=args.grid, clearance=args.clearance,
+                                  stages=None if args.stages is None else tuple(args.stages),
                                   iterations=args.iterations, ordering=args.ordering,
                                   early_refine_interval=args.early_refine_interval,
                                   force_iterations=args.force_iterations,

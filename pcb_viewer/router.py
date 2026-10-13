@@ -6,6 +6,7 @@ model, and iterative rip-up/search-and-repair with historical costs.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import heapq
 import itertools
@@ -19,6 +20,18 @@ Point = tuple[float, float]
 Cell = tuple[int, int]
 Progress = Callable[[int, int, str], bool | None]
 RoutePreview = Callable[["Autorouter", int, int, str], None]
+
+
+# Execution order is fixed; selection never reorders the pipeline.
+ROUTING_STAGES = {
+    "initial": "Global initial routing",
+    "early_refinement": "Early refinement checkpoints",
+    "repair": "Congestion search and repair",
+    "legalization": "Legalization and missing-route swaps",
+    "combined": "Combined straighten / repair / force refinement",
+    "detour_guard": "Detour guard (before and after detailed routing)",
+    "detailed": "Detailed bend / segment routing",
+}
 
 
 @dataclass
@@ -51,8 +64,25 @@ class RouterConfig:
     detailed_max_passes: int = 32
     detailed_drag_states: int = 12
     compute_backend: str = "python"
+<<<<<<< HEAD
 
     def validate(self) -> None:
+=======
+    stages: tuple[str, ...] | None = None
+
+    def stage_enabled(self, stage: str) -> bool:
+        return self.stages is None or stage in self.stages
+
+    def validate(self) -> None:
+        if self.stages is not None:
+            if (not isinstance(self.stages, (tuple, list)) or
+                    any(not isinstance(stage, str) or stage not in ROUTING_STAGES
+                        for stage in self.stages)):
+                raise ValueError("Routing stages must be a list/tuple chosen from: " +
+                                 ", ".join(ROUTING_STAGES))
+            if len(set(self.stages)) != len(self.stages):
+                raise ValueError("Routing stages cannot contain duplicates.")
+>>>>>>> 89f1990 (Add torch acceleration for cost calculations.)
         if self.compute_backend not in ("python", "torch-cpu", "torch-mps", "torch-cuda", "torch-auto"):
             raise ValueError("Unknown routing compute backend.")
         if not math.isfinite(self.grid_step) or self.grid_step <= 0:
@@ -160,6 +190,7 @@ class RouteReport:
     acceleration_fallbacks: int = 0
     selected_round: int = 1
     round_results: list[dict] = field(default_factory=list)
+    stage_results: list[dict] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
@@ -901,6 +932,8 @@ class Autorouter:
     def _legalize_routes(self, present_factor: float) -> set[int]:
         """Keep a conflict-free subset, then strictly retry every removed job.
 
+        Remove the most-conflicted job first, then the shortest terminal
+        distance, then the highest job ID when both priorities tie.
         A crossing is never written to the final board merely to increase the
         route count.  Failed retries become explicit unrouted connections.
         """
@@ -914,7 +947,7 @@ class Autorouter:
             job_id = max(
                 (candidate for candidate, neighbours in adjacency.items() if neighbours),
                 key=lambda candidate: (len(adjacency[candidate]),
-                                       math.dist(self.jobs_by_id[candidate].start,
+                                       -math.dist(self.jobs_by_id[candidate].start,
                                                  self.jobs_by_id[candidate].goal), candidate),
             )
             for neighbour in adjacency[job_id]:
@@ -1924,113 +1957,156 @@ class Autorouter:
                 return True
             return progress(done, len(self.jobs), message) is not False
 
-        for done, job in enumerate(ordered):
-            if not update(done, f"Initial routing: {job.net}"):
-                report.cancelled = True
-                break
-            path = (self._route_job(job, self.config.present_congestion_cost, True)
-                    if self.config.hard_avoidance else None)
-            if path is None:
-                path = self._route_job(job, self.config.present_congestion_cost)
-            if path is None:
-                report.failed.append({"job": job.id, "net": job.net, "reason": "no path"})
-            else:
-                self._commit(job, path)
-            placed = done + 1
-            if (self.config.early_refine_interval and
-                    placed % self.config.early_refine_interval == 0 and
-                    placed < len(ordered)):
-                checkpoint = {job_id: list(route) for job_id, route in self.routes.items()}
-                checkpoint_history = dict(self.history)
-                before_conflicts = len(self._conflicts()[0])
-                missing_so_far = {earlier.id for earlier in ordered[:placed]
-                                  if earlier.id not in self.routes}
-                moved, cancelled = self._refine_initial_routes(
-                    missing_so_far,
-                    lambda _local, _total, message: update(done, message),
-                )
-                if not cancelled and moved:
-                    _, cancelled = self._ripup_and_reroute(
-                        0, lambda _local, _total, message: update(done, message),
-                        label='Early rip-up/reroute', focus_jobs=moved)
-                report.early_refinement_passes += 1
-                if cancelled or len(self._conflicts()[0]) > before_conflicts:
-                    self._restore_routes(checkpoint)
-                    self.history = checkpoint_history
-                    if cancelled:
+        report.config["enabled_stages"] = [
+            stage for stage in ROUTING_STAGES if self.config.stage_enabled(stage)]
+
+        @contextmanager
+        def measure(stage: str, phase: str | None = None):
+            # Timing excludes metric collection. Nested checkpoint time is
+            # included in initial routing, and is also reported separately.
+            before = {"routed": len(self.routes),
+                      "wire_length": round(self._emitted_length(), 3),
+                      "conflict_cells": len(self._conflicts()[0])}
+            stage_started = time.monotonic()
+            try:
+                yield
+            finally:
+                elapsed = time.monotonic() - stage_started
+                report.stage_results.append({
+                    "stage": stage, "phase": phase, "elapsed_seconds": round(elapsed, 6),
+                    "before": before,
+                    "after": {"routed": len(self.routes),
+                              "wire_length": round(self._emitted_length(), 3),
+                              "conflict_cells": len(self._conflicts()[0])},
+                    "cancelled": report.cancelled,
+                })
+
+        if self.config.stage_enabled("initial"):
+            with measure("initial"):
+                for done, job in enumerate(ordered):
+                    if not update(done, f"Initial routing: {job.net}"):
                         report.cancelled = True
                         break
-                else:
-                    report.early_refinement_moves += len(moved)
+                    path = (self._route_job(job, self.config.present_congestion_cost, True)
+                            if self.config.hard_avoidance else None)
+                    if path is None:
+                        path = self._route_job(job, self.config.present_congestion_cost)
+                    if path is None:
+                        report.failed.append({"job": job.id, "net": job.net, "reason": "no path"})
+                    else:
+                        self._commit(job, path)
+                    placed = done + 1
+                    if (self.config.stage_enabled("early_refinement") and
+                            self.config.early_refine_interval and
+                            placed % self.config.early_refine_interval == 0 and
+                            placed < len(ordered)):
+                        with measure("early_refinement"):
+                            checkpoint = {job_id: list(route) for job_id, route in self.routes.items()}
+                            checkpoint_history = dict(self.history)
+                            before_conflicts = len(self._conflicts()[0])
+                            missing_so_far = {earlier.id for earlier in ordered[:placed]
+                                              if earlier.id not in self.routes}
+                            moved, cancelled = self._refine_initial_routes(
+                                missing_so_far,
+                                lambda _local, _total, message: update(done, message),
+                            )
+                            if not cancelled and moved:
+                                _, cancelled = self._ripup_and_reroute(
+                                    0, lambda _local, _total, message: update(done, message),
+                                    label='Early rip-up/reroute', focus_jobs=moved)
+                            report.early_refinement_passes += 1
+                            if cancelled or len(self._conflicts()[0]) > before_conflicts:
+                                self._restore_routes(checkpoint)
+                                self.history = checkpoint_history
+                                if cancelled:
+                                    report.cancelled = True
+                                    break
+                            else:
+                                report.early_refinement_moves += len(moved)
 
-        initial_conflicts, _ = self._conflicts()
-        best_conflict_count = len(initial_conflicts)
-        best_routes = {job_id: list(path) for job_id, path in self.routes.items()}
-        for iteration in range(1, self.config.iterations):
-            if report.cancelled:
-                break
-            worked, cancelled = self._ripup_and_reroute(
-                iteration,
-                lambda done, _total, message: update(done, message),
-            )
-            if not worked:
-                break
-            report.repair_iterations = iteration
-            report.cancelled = report.cancelled or cancelled
-
-            current_conflicts, _ = self._conflicts()
-            if len(current_conflicts) < best_conflict_count:
-                best_conflict_count = len(current_conflicts)
+        if self.config.stage_enabled("repair") and not report.cancelled:
+            with measure("repair"):
+                initial_conflicts, _ = self._conflicts()
+                best_conflict_count = len(initial_conflicts)
                 best_routes = {job_id: list(path) for job_id, path in self.routes.items()}
+                for iteration in range(1, self.config.iterations):
+                    if report.cancelled:
+                        break
+                    worked, cancelled = self._ripup_and_reroute(
+                        iteration,
+                        lambda done, _total, message: update(done, message),
+                    )
+                    if not worked:
+                        break
+                    report.repair_iterations = iteration
+                    report.cancelled = report.cancelled or cancelled
 
-        current_conflicts, _ = self._conflicts()
-        if len(current_conflicts) > best_conflict_count:
-            self.usage.clear()
-            self.footprints.clear()
-            self.diagonal_usage.clear()
-            self.diagonal_footprints.clear()
-            self.routes.clear()
-            for job_id, path in best_routes.items():
-                self._commit(self.jobs_by_id[job_id], path)
+                    current_conflicts, _ = self._conflicts()
+                    if len(current_conflicts) < best_conflict_count:
+                        best_conflict_count = len(current_conflicts)
+                        best_routes = {job_id: list(path) for job_id, path in self.routes.items()}
+
+                current_conflicts, _ = self._conflicts()
+                if len(current_conflicts) > best_conflict_count:
+                    self.usage.clear()
+                    self.footprints.clear()
+                    self.diagonal_usage.clear()
+                    self.diagonal_footprints.clear()
+                    self.routes.clear()
+                    for job_id, path in best_routes.items():
+                        self._commit(self.jobs_by_id[job_id], path)
 
         if self.config.strict_final and not report.cancelled:
-            failed_final = self._legalize_routes(
-                self.config.present_congestion_cost * self.config.iterations
-            )
-            # Initial maze failures were not part of the conflict graph; they
-            # deserve the same post-legalization shove opportunity.
-            failed_final.update(job.id for job in self.jobs if job.id not in self.routes)
-            failed_final = self._shove_unrouted(
-                failed_final, self.config.present_congestion_cost * self.config.iterations
-            )
+            failed_final = {job.id for job in self.jobs if job.id not in self.routes}
+            if self.config.stage_enabled("legalization"):
+                with measure("legalization"):
+                    failed_final = self._legalize_routes(
+                        self.config.present_congestion_cost * self.config.iterations
+                    )
+                    # Initial maze failures were not part of the conflict graph; they
+                    # deserve the same post-legalization shove opportunity.
+                    failed_final.update(job.id for job in self.jobs if job.id not in self.routes)
+                    failed_final = self._shove_unrouted(
+                        failed_final, self.config.present_congestion_cost * self.config.iterations
+                    )
             failed_before_force = len(failed_final)
-            (failed_final, report.force_iterations_run, report.force_jobs_moved,
-             force_cancelled) = self._force_refine(
-                 failed_final,
-                 lambda _done, _total, message: update(len(self.jobs) - 1, message),
-            )
-            report.cancelled = report.cancelled or force_cancelled
-            overlong = set()
-            for job_id, path in list(self.routes.items()):
-                if self._excessive_detour(self.jobs_by_id[job_id], path):
-                    self._remove(job_id)
-                    overlong.add(job_id)
-            failed_final.update(overlong)
+            if self.config.stage_enabled("combined") and self.config.force_iterations:
+                with measure("combined"):
+                    (failed_final, report.force_iterations_run, report.force_jobs_moved,
+                     force_cancelled) = self._force_refine(
+                         failed_final,
+                         lambda _done, _total, message: update(len(self.jobs) - 1, message),
+                    )
+                    report.cancelled = report.cancelled or force_cancelled
             report.force_new_connections = failed_before_force - len(failed_final)
+            overlong = set()
+            if (not report.cancelled and self.config.stage_enabled("detour_guard")
+                    and self.config.max_detour_ratio):
+                with measure("detour_guard", "before_detailed"):
+                    for job_id, path in list(self.routes.items()):
+                        if self._excessive_detour(self.jobs_by_id[job_id], path):
+                            self._remove(job_id)
+                            overlong.add(job_id)
+                    failed_final.update(overlong)
             failed_before_detail = len(failed_final)
-            if not report.cancelled:
-                (failed_final, report.detailed_passes, report.detailed_straightened,
-                 report.detailed_dragged, detailed_cancelled) = self._detailed_route(
-                     failed_final,
-                     lambda _done, _total, message: update(len(self.jobs) - 1, message),
-                )
-                report.cancelled = report.cancelled or detailed_cancelled
-            for job_id, path in list(self.routes.items()):
-                if self._excessive_detour(self.jobs_by_id[job_id], path):
-                    self._remove(job_id)
-                    overlong.add(job_id)
-                    failed_final.add(job_id)
+            if (not report.cancelled and self.config.stage_enabled("detailed")
+                    and self.config.detailed_max_passes):
+                with measure("detailed"):
+                    (failed_final, report.detailed_passes, report.detailed_straightened,
+                     report.detailed_dragged, detailed_cancelled) = self._detailed_route(
+                         failed_final,
+                         lambda _done, _total, message: update(len(self.jobs) - 1, message),
+                    )
+                    report.cancelled = report.cancelled or detailed_cancelled
             report.detailed_new_connections = failed_before_detail - len(failed_final)
+            if (not report.cancelled and self.config.stage_enabled("detour_guard")
+                    and self.config.max_detour_ratio):
+                with measure("detour_guard", "after_detailed"):
+                    for job_id, path in list(self.routes.items()):
+                        if self._excessive_detour(self.jobs_by_id[job_id], path):
+                            self._remove(job_id)
+                            overlong.add(job_id)
+                            failed_final.add(job_id)
             report.failed = [{"job": job.id, "net": job.net,
                               "reason": ("route exceeds detour limit; consider another layer"
                                          if job.id in overlong and job.id in failed_final else
@@ -2044,23 +2120,29 @@ class Autorouter:
             return self._unique_wire_runs()
 
         wires = output_wires()
-        if self.config.strict_final and not report.cancelled:
-            crossings = self._geometric_crossings(wires)
-            while crossings:
-                severity = {job_id: sum(job_id in pair for pair in crossings)
-                            for pair in crossings for job_id in pair}
-                rejected_id = max(severity, key=lambda job_id: (severity[job_id],
-                                   math.dist(self.jobs_by_id[job_id].start,
-                                             self.jobs_by_id[job_id].goal), job_id))
-                self._remove(rejected_id)
-                job = self.jobs_by_id[rejected_id]
-                report.failed.append({"job": job.id, "net": job.net,
-                                      "reason": "geometric crossing in final route"})
-                wires = output_wires()
+        if (self.config.strict_final and not report.cancelled
+                and self.config.stage_enabled("legalization")):
+            with measure("legalization", "final_crossings"):
                 crossings = self._geometric_crossings(wires)
-            conflict_cells, conflict_jobs = self._conflicts()
-            report.conflict_cells = len(conflict_cells)
-            report.conflicting_jobs = sorted(conflict_jobs)
+                while crossings:
+                    severity = {job_id: sum(job_id in pair for pair in crossings)
+                                for pair in crossings for job_id in pair}
+                    rejected_id = max(severity, key=lambda job_id: (severity[job_id],
+                                       -math.dist(self.jobs_by_id[job_id].start,
+                                                 self.jobs_by_id[job_id].goal), job_id))
+                    self._remove(rejected_id)
+                    job = self.jobs_by_id[rejected_id]
+                    report.failed.append({"job": job.id, "net": job.net,
+                                          "reason": "geometric crossing in final route"})
+                    wires = output_wires()
+                    crossings = self._geometric_crossings(wires)
+                conflict_cells, conflict_jobs = self._conflicts()
+                report.conflict_cells = len(conflict_cells)
+                report.conflicting_jobs = sorted(conflict_jobs)
+        crossings = self._geometric_crossings(wires)
+        report.conflict_cells += len(crossings)
+        report.conflicting_jobs = sorted(set(report.conflicting_jobs) |
+                                         {job_id for pair in crossings for job_id in pair})
         report.wire_length = sum(
             math.dist(a, b) for wire in wires
             for a, b in zip(wire['points'], wire['points'][1:])
@@ -2113,7 +2195,8 @@ def autoroute_data(data: dict, config: RouterConfig | None = None,
                         'jobs_total': report.jobs_total, 'conflict_cells': report.conflict_cells,
                         'wire_length': report.wire_length,
                         'elapsed_seconds': report.elapsed_seconds,
-                        'cancelled': report.cancelled})
+                        'cancelled': report.cancelled,
+                        'stage_results': report.stage_results})
         if report.cancelled:
             cancelled = True
             if best is None:

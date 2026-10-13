@@ -139,3 +139,40 @@ No route order, stopping criterion, heuristic or legalization rule changes.
 See [benchmarks/README.md](benchmarks/README.md) for profiling evidence and
 reproduction. Accelerating independent randomized trials with processes is
 possible future work, but is separate from this tensor backend.
+
+## Selectable pipeline and stage measurements
+
+`RouterConfig.stages` is an optional allowlist of stage identifiers from
+`ROUTING_STAGES`. `None` retains the complete default pipeline; an empty tuple
+runs no placement or optimization. The GUI and `--stages` CLI option expose the
+same allowlist. The canonical execution order remains initial routing (with
+optional nested early checkpoints), congestion repair, legalization and shove,
+combined refinement, detour filtering, detailed routing, and detour filtering
+again. The selectable IDs and usage examples are in README's “Select routing
+stages for experiments” section. Randomized order trials remain controlled by
+`random_rounds`; each trial uses the same stage selection on a fresh router.
+
+Stages may be omitted independently. Early refinement only executes inside
+initial placement. Detailed routing can start with no generated connections.
+Combined/detailed routines retain their existing legal-state rollback behavior;
+if earlier stages leave conflicts, these routines may make no progress.
+Existing interval, iteration, and `strict_final` controls still apply. Shared
+primitives (obstacle construction, pin access, patterns, A*, DRC) stay available
+to every selected stage that uses them. A disabled top-level repair stage does
+not disable local repair inside a selected early or combined stage.
+
+Final read-only clearance and geometric crossing checks are unconditional.
+Final crossing *removal* belongs to legalization and is skipped if that stage
+is omitted, preserving provisional results for ablation studies. Remaining
+geometric crossing pairs contribute to the final conflict count as well as
+raster conflict locations. No omitted stage is silently re-enabled.
+
+Each executed stage visit adds a `stage_results` record containing before/after
+routed-request count, emitted length, raster conflict count, elapsed time, and
+cancellation status. Detour visits have `before_detailed`/`after_detailed` phases;
+legalization's final crossing cleanup has `final_crossings`. Records are appended
+on stage completion, so nested early checkpoints precede their enclosing initial
+record. Initial timing includes those checkpoints; other stage timings exclude
+their boundary metric collection. Top-level results describe the selected trial,
+while every `round_results` entry retains its own measurements. Connection gains
+for combined/detailed stages exclude removals by the separate detour guard.

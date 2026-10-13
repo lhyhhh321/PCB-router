@@ -146,3 +146,54 @@ QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
 
 Tests cover all four supplied boards, lossless JSON round trips, mask persistence and metadata preservation, undo/redo (including a complete routing run as one edit), failed saves, invalid polygons, router obstacle behavior, and offscreen GUI rendering.
+
+## Select routing stages for experiments
+
+In **Auto route → Routing stages…**, check the built-in stages to include in
+this run. All are selected by default. The CLI exposes the same selection:
+
+```bash
+# Initial placement only
+python -m pcb_viewer input.json --autoroute --stages initial --output initial.json
+
+# Global routing without combined refinement or detailed routing
+python -m pcb_viewer input.json --autoroute \
+  --stages initial early_refinement repair legalization detour_guard \
+  --output global.json
+
+# Full default pipeline (omit --stages)
+python -m pcb_viewer input.json --autoroute --output full.json
+```
+
+Available names are `initial`, `early_refinement`, `repair`, `legalization`,
+`combined`, `detour_guard`, and `detailed`. Selection preserves the pipeline's
+execution order, regardless of argument order. `--stages` with no names selects
+none. In Python, use `RouterConfig(stages=("initial", "repair", "legalization"))`;
+`None` selects all and `()` selects none. Selection applies only to the built-in
+router; randomized trials each use the same selection.
+
+Early checkpoints require `initial`. Existing zero-valued iteration/interval
+controls still disable their work. Pin access, obstacles, pattern/A* searches,
+and DRC are underlying mechanisms, not independently selectable pipeline stages.
+The combined stage includes straightening, local repair, and force refinement;
+the detailed stage includes straightening, A*, and segment dragging. Their
+existing tuning controls remain available.
+
+Final conflict checks always run. Omitting `legalization` also omits final
+crossing removal, so experimental output may retain conflicts; the report and
+CLI exit status reflect them. An empty selection creates no generated routes;
+it does not resume a previous run. The existing `strict_final=False` Python
+option still bypasses all post-repair stages.
+
+`autoroute_report.config.enabled_stages` records the selection. `stage_results`
+records each executed stage's `elapsed_seconds`, `before`/`after` connection
+count (`routed`), emitted copper `wire_length`, raster `conflict_cells`, and
+cancellation status. The GUI shows these results after a run; CLI output also
+saves them in JSON. Each entry in `round_results` has its own stage results;
+the top-level results belong to the selected trial. Unexecuted stages have no
+result entry. Early checkpoints appear individually and their time is included
+in `initial`, so do not sum those timings together. Detour filtering runs before
+and after detailed routing, and legalization has a final crossing-cleanup visit;
+`phase` distinguishes those visits. Metric collection and grid preparation add
+overhead to the total run time. Compare connection count, conflicts, length, and
+elapsed time together, keeping the board, grid, seed, and other settings fixed.

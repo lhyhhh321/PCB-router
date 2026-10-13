@@ -406,3 +406,33 @@ def test_auto_route_sidebar_tracks_tabs_and_undo(qt_app):
     assert labels['connections'].text() == '1 / 2'
     w.document.saved_position = w.document.position
     w.close()
+
+
+def test_gui_stage_selection_reaches_router(qt_app, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QMessageBox, QPushButton
+    from pcb_viewer.app import MainWindow, RoutingStagesDialog
+    w = MainWindow()
+    w.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'width': 1,
+         'start': [0, 0], 'end': [20, 0]},
+    ]
+    w.refresh()
+
+    def accept(dialog):
+        if isinstance(dialog, RoutingStagesDialog):
+            for stage, checkbox in dialog.checks.items():
+                checkbox.setChecked(stage == 'initial')
+        else:
+            dialog.findChild(QPushButton, 'routing_stages').click()
+        return 1
+
+    monkeypatch.setattr(QDialog, 'exec', accept)
+    monkeypatch.setattr(QMessageBox, 'information', lambda *_args: None)
+    monkeypatch.setattr(QMessageBox, 'question',
+                        lambda *_args: QMessageBox.StandardButton.Discard)
+    w.autoroute()
+    report = w.sessions[w.current_session]['benchmarks']['Built-in']
+    assert report.config['enabled_stages'] == ['initial']
+    assert [row['stage'] for row in report.stage_results] == ['initial']
+    assert report.routed == 1
+    w.close()
