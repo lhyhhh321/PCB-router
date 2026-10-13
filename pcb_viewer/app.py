@@ -766,6 +766,12 @@ class MainWindow(QMainWindow):
                 stage_button.setText(f'Routing stages: {len(selected_stages)}/{len(ROUTING_STAGES)} selected…')
         stage_button.clicked.connect(choose_stages)
         layout.addWidget(stage_button)
+        resume = QCheckBox('Continue existing routing')
+        resume.setObjectName('resume_routing')
+        resume.setChecked(any(wire.get('route_type') == 'autoroute'
+                              for wire in self.document.data.get('wires', [])))
+        resume.setToolTip('Load saved generated connections as editable routes and route the missing ones.')
+        layout.addWidget(resume)
         layout.addWidget(QLabel('Built-in routing priority'))
         ordering = QComboBox()
         ordering.addItems(['Higher completion (dense areas first)', 'Faster (short routes first)'])
@@ -889,6 +895,7 @@ class MainWindow(QMainWindow):
         detour_row.addWidget(max_detour_ratio)
         layout.addLayout(detour_row)
         algorithm.currentIndexChanged.connect(lambda index: (
+            resume.setEnabled(index == 0),
             stage_button.setEnabled(index == 0),
             compute_backend.setEnabled(index == 0),
             rounds_label.setEnabled(index == 0),
@@ -923,13 +930,15 @@ class MainWindow(QMainWindow):
             return
 
         scratch = copy.deepcopy(self.document.data)
-        scratch['wires'] = [wire for wire in scratch.get('wires', [])
-                            if wire.get('route_type') != 'autoroute']
+        resume_enabled = resume.isChecked() and algorithm.currentIndex() == 0
+        if not resume_enabled:
+            scratch['wires'] = [wire for wire in scratch.get('wires', [])
+                                if wire.get('route_type') != 'autoroute']
         scratch.pop('autoroute_report', None)
         benchmark_input = hashlib.sha256(json.dumps(
             scratch, sort_keys=True, ensure_ascii=False,
             separators=(',', ':')).encode('utf-8')).hexdigest()
-        config = RouterConfig(stages=selected_stages,
+        config = RouterConfig(stages=selected_stages, resume=resume_enabled,
                               grid_step=fields['Grid spacing'].value(),
                               clearance=fields['Clearance'].value(),
                               iterations=iterations.value(),
@@ -1029,7 +1038,8 @@ class MainWindow(QMainWindow):
 
         existing = self.document.data.get('wires', [])
         generated = [index for index, wire in enumerate(existing)
-                     if wire.get('route_type') == 'autoroute']
+                     if wire.get('route_type') == 'autoroute' and
+                     (not resume_enabled or wire.get('layer', self.document.data.get('layer')) == report.layer)]
         changes = [('wires', index, None) for index in reversed(generated)]
         base = len(existing) - len(generated)
         changes.extend(('wires', base + index, wire) for index, wire in enumerate(wires))
@@ -1053,6 +1063,7 @@ class MainWindow(QMainWindow):
                   f'{len(report.failed)} unrouted connections.\n\n'
                   'Generated traces are one undoable edit. Review and run final fabrication DRC before use.')
         if not use_freerouting:
+            detail += f'\nResumed connections: {report.resumed_connections}.'
             detail += '\nSelected stages: ' + (', '.join(report.config.get('enabled_stages', [])) or 'none')
             if report.stage_results:
                 detail += '\nStage results (selected trial; initial includes checkpoints):'

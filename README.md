@@ -197,3 +197,43 @@ and after detailed routing, and legalization has a final crossing-cleanup visit;
 `phase` distinguishes those visits. Metric collection and grid preparation add
 overhead to the total run time. Compare connection count, conflicts, length, and
 elapsed time together, keeping the board, grid, seed, and other settings fixed.
+
+## Continue a partially routed board
+
+Open the saved board and use **Auto route → Continue existing routing**. This
+option is checked automatically when the board contains generated routes;
+uncheck it to start over. For the supplied example:
+
+```bash
+python -m pcb_viewer pcb_example/route140.json --autoroute --resume \
+  --output /tmp/route140-continued.json
+```
+
+Python callers can pass the original board (including its `wires`) to
+`autoroute_data(data, RouterConfig(resume=True))`. The returned wires replace
+previous generated wires on the routed layer; retain ordinary fixed copper and
+other layers. The GUI and CLI perform this replacement automatically. The GUI
+commits the whole continuation as one undoable edit, and cancellation preserves
+the original board.
+
+Resume imports saved `route_type: "autoroute"` connections using their
+`autoroute_job`/`autoroute_jobs` metadata and the original routing requests.
+Shared fragments are reassembled and connectivity is checked in source
+coordinates before converting to the routing grid. Existing complete connections
+become editable routes, and initial placement attempts only missing requests.
+Selected repair, legalization, and refinement stages can subsequently modify or
+remove imported routes. Unchanged imported centerlines retain their exact saved
+geometry, including off-grid terminals. Use the original grid spacing when
+possible; route occupancy and any new or modified routes use the selected grid.
+
+The supplied `route140.json` contains 204 wire records representing **206 of 220
+connections**, leaving 14 missing. `resumed_connections` records this starting
+count; `routed` records final total completion. Stage measurements start from
+the imported state. Randomized trials each start from the same saved copper.
+
+This mode resumes saved built-in routing results, not arbitrary CAD netlist
+reconstruction. Keep the original connection requests and generated-wire IDs.
+Mismatched IDs/nets or fragments that do not connect both terminals produce an
+error instead of being counted as completed or silently discarded. Ordinary
+untagged wires remain fixed copper. Resume is available for the built-in router;
+Freerouting retains its existing fresh-run behavior.

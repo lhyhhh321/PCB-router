@@ -176,3 +176,27 @@ record. Initial timing includes those checkpoints; other stage timings exclude
 their boundary metric collection. Top-level results describe the selected trial,
 while every `round_results` entry retains its own measurements. Connection gains
 for combined/detailed stages exclude removals by the separate detour guard.
+
+## Resume saved partial routing
+
+`RouterConfig.resume` defaults to false. When enabled, generated wires on the
+selected layer are removed from the fixed-obstacle input and reconstructed as
+initial entries in `routes`, `usage`, and diagonal occupancy. Non-generated
+copper and other layers remain fixed. The input dictionary is not mutated.
+
+`_load_existing_routes()` groups saved wire fragments by their recorded request
+IDs, verifies matching nets, builds source-coordinate connectivity graphs, and
+splits segments at shared fragment junctions and terminals. A complete path
+between each recorded request's exact terminals is required. This avoids treating
+a small physical gap as connected merely because its ends snap to one grid cell.
+Saved centerlines are retained for unchanged imported paths; modified paths use
+the normal grid-derived output. The search region includes imported geometry.
+
+Initial routing skips already-loaded jobs. Imported copper is movable through
+all selected repair/refinement stages, and existing legalization checks still
+apply. Each randomized trial independently imports the same partial board.
+`RouteReport.resumed_connections` distinguishes initial completion from final
+`routed`; stage before/after measurements include the imported routes.
+The CLI and GUI replace generated wires once after successful completion,
+avoiding duplicate copper. Invalid or disconnected saved route records fail
+before the GUI document or output file is changed.

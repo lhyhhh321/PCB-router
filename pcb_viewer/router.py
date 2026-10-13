@@ -6,6 +6,7 @@ model, and iterative rip-up/search-and-repair with historical costs.
 """
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import heapq
@@ -65,6 +66,7 @@ class RouterConfig:
     detailed_drag_states: int = 12
     compute_backend: str = "python"
     stages: tuple[str, ...] | None = None
+    resume: bool = False
 
     def stage_enabled(self, stage: str) -> bool:
         return self.stages is None or stage in self.stages
@@ -164,6 +166,7 @@ class RouteReport:
     layer: str
     jobs_total: int
     routed: int = 0
+    resumed_connections: int = 0
     failed: list[dict] = field(default_factory=list)
     conflict_cells: int = 0
     conflicting_jobs: list[int] = field(default_factory=list)
@@ -285,6 +288,14 @@ class Autorouter:
         self.clearance = (self.config.clearance if self.config.clearance is not None
                           else _number(rules.get("clearance_mil"), 2.0))
         self.step = self.config.grid_step
+        self.resume_wires = [wire for wire in data.get("wires", [])
+                             if wire.get("route_type") == "autoroute"
+                             and wire.get("layer", data.get("layer")) == self.layer] if self.config.resume else []
+        if self.resume_wires:
+            # Imported routes must be movable dynamic copper, not fixed obstacles.
+            imported = {id(wire) for wire in self.resume_wires}
+            self.data = {**data, "wires": [wire for wire in data.get("wires", [])
+                                           if id(wire) not in imported]}
         self._build_region()
         self.static: dict[int, set[str | None]] = {}
         self.usage: dict[int, set[int]] = {}
@@ -302,11 +313,89 @@ class Autorouter:
         }
         self._offset_cache: dict[tuple[int, int], tuple[Cell, ...]] = {}
         self._rasterize_board()
+        self.resume_paths: dict[int, list[Cell]] = {}
+        self.resume_points: dict[int, list[Point]] = {}
+        self._load_existing_routes()
+        self.resumed_connections = len(self.routes)
+
+    def _load_existing_routes(self) -> None:
+        """Reconstruct complete saved connections, including shared fragments.
+
+        Connectivity is checked in source coordinates before grid conversion;
+        nearby but disconnected fragment ends must not become a completed job.
+        """
+        by_job: dict[int, list[dict]] = {}
+        for wire in self.resume_wires:
+            ids = wire.get("autoroute_jobs", [wire.get("autoroute_job")])
+            points = wire.get("points")
+            if (not isinstance(ids, list) or not ids or
+                    not isinstance(points, list) or len(points) < 2 or
+                    any(not isinstance(point, (list, tuple)) or len(point) != 2 or
+                        any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                            for value in point) for point in points)):
+                raise ValueError("Cannot resume malformed generated wire geometry or connection IDs.")
+            for job_id in ids:
+                job = self.jobs_by_id.get(job_id) if type(job_id) is int else None
+                if job is None or job.net != wire.get("net"):
+                    raise ValueError("Cannot resume: generated wire IDs/nets do not match routing requests.")
+                by_job.setdefault(job_id, []).append(wire)
+
+        for job_id, wires in by_job.items():
+            job = self.jobs_by_id[job_id]
+            def point_key(point):
+                return (round(float(point[0]), 6), round(float(point[1]), 6))
+            start, goal = point_key(job.start), point_key(job.goal)
+            segments = [(point_key(a), point_key(b)) for wire in wires
+                        for a, b in zip(wire["points"], wire["points"][1:])]
+            vertices = {point for segment in segments for point in segment} | {start, goal}
+            graph: dict[Point, set[Point]] = {}
+            # A shared owner wire may span a fragment's junction; split there
+            # even if simplification omitted that junction from its vertices.
+            for a, b in segments:
+                points = sorted((point for point in vertices
+                                 if self._distance_to_segment(*point, a, b) <= 1e-6),
+                                key=lambda point: math.dist(a, point))
+                for first, second in zip(points, points[1:]):
+                    graph.setdefault(first, set()).add(second)
+                    graph.setdefault(second, set()).add(first)
+            previous = {start: None}
+            queue = deque([start])
+            while queue and goal not in previous:
+                current = queue.popleft()
+                for neighbour in sorted(graph.get(current, ())):
+                    if neighbour not in previous:
+                        previous[neighbour] = current
+                        queue.append(neighbour)
+            if goal not in previous or start not in graph or goal not in graph:
+                raise ValueError(f"Cannot resume connection {job_id} ({job.net}): "
+                                 "saved fragments do not connect both terminals.")
+            points = []
+            current = goal
+            while current is not None:
+                points.append(current)
+                current = previous[current]
+            points.reverse()
+            cells = [self._cell(points[0])]
+            for a, b in zip(points, points[1:]):
+                cells.extend(self._grid_line(self._cell(a), self._cell(b))[1:])
+            # Keep the source centerline until a refinement actually changes
+            # this route. Off-grid terminal access must not shift on import.
+            raw = [points[0]]
+            for a, b in zip(points, points[1:]):
+                raw.extend(point for cell in self._grid_line(self._cell(a), self._cell(b))
+                           if (point := self._point(cell)) not in (a, b)
+                           and self._distance_to_segment(*point, a, b) <= 1e-6)
+                raw.append(b)
+            self.resume_paths[job.id] = list(cells)
+            self.resume_points[job.id] = raw
+            self._commit(job, cells)
 
     def _build_region(self) -> None:
         routing_points = [point for job in self.jobs
                           for point in ((job.guide if self.config.use_routing_guides and job.guide
                                          else (job.start, job.goal)))]
+        routing_points.extend(tuple(point) for wire in self.resume_wires
+                              for point in wire.get("points", []))
         xs = [point[0] for point in routing_points]
         ys = [point[1] for point in routing_points]
         margin = self.config.boundary_margin
@@ -1827,6 +1916,10 @@ class Autorouter:
 
     def _raw_points(self, job: RoutingJob, cells: list[Cell]) -> list[Point]:
         """Keep every grid edge until duplicate same-net copper is removed."""
+        source = self.jobs_by_id.get(job.id)
+        if (source is not None and job.start == source.start and job.goal == source.goal
+                and cells == self.resume_paths.get(job.id)):
+            return self.resume_points[job.id]
         return [job.start, *(self._point(cell) for cell in cells[1:-1]), job.goal]
 
     def _unique_wire_runs(self) -> list[dict]:
@@ -1942,8 +2035,9 @@ class Autorouter:
         started = time.monotonic()
         report = RouteReport(self.layer, len(self.jobs),
                              config={"backend": "builtin", **asdict(self.config)})
+        report.resumed_connections = self.resumed_connections
         report.config["compute_device"] = self.torch_costs.device if self.torch_costs else "python"
-        ordered = self._initial_order()
+        ordered = [job for job in self._initial_order() if job.id not in self.routes]
 
         def update(done: int, message: str) -> bool:
             if preview is not None:
@@ -2188,6 +2282,7 @@ def autoroute_data(data: dict, config: RouterConfig | None = None,
             wires, report = router.route(round_progress, round_preview)
         results.append({'round': round_index + 1, 'seed': seed, 'routed': report.routed,
                         'jobs_total': report.jobs_total, 'conflict_cells': report.conflict_cells,
+                        'resumed_connections': report.resumed_connections,
                         'wire_length': report.wire_length,
                         'elapsed_seconds': report.elapsed_seconds,
                         'cancelled': report.cancelled,

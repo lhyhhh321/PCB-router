@@ -436,3 +436,35 @@ def test_gui_stage_selection_reaches_router(qt_app, monkeypatch):
     assert [row['stage'] for row in report.stage_results] == ['initial']
     assert report.routed == 1
     w.close()
+
+
+def test_gui_resume_is_one_undoable_edit(qt_app, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QMessageBox, QCheckBox, QPushButton
+    from pcb_viewer.app import MainWindow, RoutingStagesDialog
+    from pcb_viewer.router import RouterConfig, autoroute_data
+    w = MainWindow()
+    w.document.data['routing_connections'] = [
+        {'net': f'N{i}', 'layer': 'TOP', 'width': 1,
+         'start': [0, i * 20], 'end': [20, i * 20]} for i in range(2)]
+    wires, _ = autoroute_data(w.document.data, RouterConfig(stages=('initial',)))
+    w.document.data['wires'] = [wire for wire in wires if wire['autoroute_job'] == 0]
+    original = copy.deepcopy(w.document.data['wires'])
+    w.refresh()
+    def accept(dialog):
+        if isinstance(dialog, RoutingStagesDialog):
+            for stage, checkbox in dialog.checks.items():
+                checkbox.setChecked(stage == 'initial')
+        else:
+            assert dialog.findChild(QCheckBox, 'resume_routing').isChecked()
+            dialog.findChild(QPushButton, 'routing_stages').click()
+        return 1
+    monkeypatch.setattr(QDialog, 'exec', accept)
+    monkeypatch.setattr(QMessageBox, 'information', lambda *_args: None)
+    monkeypatch.setattr(QMessageBox, 'question', lambda *_args: QMessageBox.StandardButton.Discard)
+    w.autoroute()
+    report = w.sessions[w.current_session]['benchmarks']['Built-in']
+    assert report.resumed_connections == 1 and report.routed == 2
+    assert len(w.document.data['wires']) == 2
+    w.history(False)
+    assert w.document.data['wires'] == original
+    w.close()
