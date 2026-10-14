@@ -29,7 +29,7 @@ ROUTING_STAGES = {
     "early_refinement": "Early refinement checkpoints",
     "repair": "Congestion search and repair",
     "legalization": "Legalization and missing-route swaps",
-    "combined": "Combined straighten / repair / force refinement",
+    "combined": "Board-wide force compaction",
     "detour_guard": "Detour guard (before and after detailed routing)",
     "detailed": "Detailed bend / segment routing",
 }
@@ -60,7 +60,7 @@ class RouterConfig:
     early_refine_interval: int = 192
     force_iterations: int = 6
     force_max_jobs: int = 12
-    attraction_strength: float = 0.5
+    attraction_strength: float = 1.0
     max_detour_ratio: float = 3.0
     detailed_max_passes: int = 32
     detailed_drag_states: int = 12
@@ -189,6 +189,8 @@ class RouteReport:
     selected_round: int = 1
     round_results: list[dict] = field(default_factory=list)
     stage_results: list[dict] = field(default_factory=list)
+    wire_updates: list[dict] = field(default_factory=list)
+    compaction_results: list[dict] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
@@ -296,6 +298,10 @@ class Autorouter:
             imported = {id(wire) for wire in self.resume_wires}
             self.data = {**data, "wires": [wire for wire in data.get("wires", [])
                                            if id(wire) not in imported]}
+        index_by_object = {id(wire): i for i, wire in enumerate(data.get('wires', []))}
+        self.input_wire_indices = [index_by_object[id(wire)] for wire in self.data.get('wires', [])]
+        self.wire_updates: dict[int, dict] = {}
+        self.compaction_results: list[dict] = []
         self._build_region()
         self.static: dict[int, set[str | None]] = {}
         self.usage: dict[int, set[int]] = {}
@@ -396,6 +402,9 @@ class Autorouter:
                                          else (job.start, job.goal)))]
         routing_points.extend(tuple(point) for wire in self.resume_wires
                               for point in wire.get("points", []))
+        if self.config.stage_enabled("combined"):
+            routing_points.extend(tuple(point) for wire in self.data.get("wires", [])
+                                  if self._applies_to_layer(wire) for point in wire.get("points", []))
         xs = [point[0] for point in routing_points]
         ys = [point[1] for point in routing_points]
         margin = self.config.boundary_margin
@@ -1315,12 +1324,20 @@ class Autorouter:
             point = samples[index]
             cell = self._cell(point)
             nearest: dict[int, tuple[float, Point]] = {}
+            fixed_nets: dict[str, tuple[float, Point]] = {}
             for dx, dy in offsets:
                 nearby = cell[0] + dx, cell[1] + dy
                 if not self._inside(nearby):
                     continue
                 other_point = self._point(nearby)
                 distance = math.dist(point, other_point)
+                if use_attraction:
+                    # Static occupancy includes copper surfaces, already expanded
+                    # by their physical width/shape, and excludes other layers.
+                    for net in self.static.get(self._key(nearby), ()):
+                        if net and net != job.net:
+                            if net not in fixed_nets or distance < fixed_nets[net][0]:
+                                fixed_nets[net] = distance, other_point
                 for other_id in self.usage.get(self._key(nearby), ()):
                     if other_id == job.id or self.jobs_by_id[other_id].net == job.net:
                         continue
@@ -1372,14 +1389,18 @@ class Autorouter:
             # its outer radius, and exerts no attraction inside the target.
             # Do not counteract a missing airwire's attempt to clear space.
             if use_attraction and not near_missing:
-                nearest_nets: dict[str, tuple[float, Point, RoutingJob]] = {}
+                # Compare distance beyond the preferred spacing: fixed cells
+                # represent surfaces, whereas dynamic cells represent centerlines.
+                fixed_target = job.width / 2 + self.clearance + 3 * self.step
+                nearest_nets = {net: (distance, point, fixed_target)
+                                for net, (distance, point) in fixed_nets.items()}
                 for other_id, (distance, other_point) in nearest.items():
                     other = self.jobs_by_id[other_id]
-                    if (other.net not in nearest_nets or
-                            distance < nearest_nets[other.net][0]):
-                        nearest_nets[other.net] = distance, other_point, other
-                for distance, other_point, other in nearest_nets.values():
                     target = (job.width + other.width) / 2 + self.clearance + 3 * self.step
+                    previous = nearest_nets.get(other.net)
+                    if previous is None or distance - target < previous[0] - previous[2]:
+                        nearest_nets[other.net] = distance, other_point, target
+                for distance, other_point, target in nearest_nets.values():
                     band = max(2 * self.step, target * 0.5)
                     if distance >= target + band:
                         continue
@@ -1495,159 +1516,10 @@ class Autorouter:
 
     def _force_refine(self, failed: set[int], progress: Progress | None = None
                       ) -> tuple[set[int], int, int, bool]:
-        """Each iteration straightens, repairs, then balances legal routes."""
-        if not self.config.force_iterations:
-            return failed, 0, 0, False
-        original_routes = {job_id: list(path) for job_id, path in self.routes.items()}
-        original_failed = set(failed)
-        original_length = self._emitted_length()
-        best_routes = original_routes
-        best_failed = original_failed
-        best_length = original_length
-        best_bends = sum(self._path_bends(path) for path in original_routes.values())
-        best_moved = 0
-        iterations_run = moved_total = 0
-        control_guides: dict[int, tuple[Point, ...]] = {}
-        control_ghosts: dict[int, set[int]] = {}
-        present_factor = self.config.present_congestion_cost * self.config.iterations
-
-        def remember_best() -> None:
-            nonlocal best_routes, best_failed, best_length, best_bends, best_moved
-            length = self._emitted_length()
-            bends = sum(self._path_bends(path) for path in self.routes.values())
-            if (len(failed) < len(best_failed) or
-                    (len(failed) == len(best_failed) and
-                     (length < best_length - 1e-7 or
-                      (abs(length - best_length) <= 1e-7 and bends < best_bends)))):
-                best_routes = {job_id: list(path) for job_id, path in self.routes.items()}
-                best_failed = set(failed)
-                best_length = length
-                best_bends = bends
-                best_moved = moved_total
-
-        for iteration in range(1, self.config.force_iterations + 1):
-            iterations_run += 1
-            if progress and progress(iteration, self.config.force_iterations,
-                                     f'Iteration {iteration}: straighten, repair, balance') is False:
-                self._restore_routes(original_routes)
-                return original_failed, iterations_run, 0, True
-            before_repair = {job_id: list(path) for job_id, path in self.routes.items()}
-            failed_before_repair = set(failed)
-            self._straighten_routes()
-            failed = self._shove_unrouted(failed, present_factor)
-            self._shorten_detours(present_factor)
-            if self._conflicts()[0] or self._geometric_crossings(self._unique_wire_runs()):
-                self._restore_routes(before_repair)
-                failed = failed_before_repair
-            else:
-                remember_best()
-            if not self.config.force_max_jobs:
-                continue
-            snapshot = {job_id: list(path) for job_id, path in self.routes.items()}
-            old_failed = set(failed)
-            old_energy = self._force_state_energy(failed)
-            missing = [self.jobs_by_id[job_id] for job_id in sorted(failed)]
-            candidates = []
-            for job_id, path in snapshot.items():
-                job = self.jobs_by_id[job_id]
-                guide, energy, affected = self._relaxed_guide(
-                    job, path, missing, control_guides.get(job_id), attract=True)
-                affected.update(control_ghosts.get(job_id, ()))
-                displacement = sum(math.dist(a, b) for a, b in
-                                   zip(guide, self._sample_route(job, path)))
-                if displacement > 0.05:
-                    candidates.append((bool(affected), max(energy, 0.0),
-                                       displacement, energy, job_id, guide, affected))
-            candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[4]))
-            if self.config.attraction_strength:
-                # Missing-airwire routes remain the priority, but reserve a
-                # small share for attraction-dominated spacing candidates.
-                # Otherwise dense boards can starve that new force entirely.
-                spacing = [item for item in candidates
-                           if not item[0] and item[3] < 0]
-                reserved = min(self.config.force_max_jobs // 3, len(spacing))
-                selected = candidates[:self.config.force_max_jobs - reserved]
-                selected_ids = {item[4] for item in selected}
-                for item in spacing:
-                    if len(selected) >= self.config.force_max_jobs:
-                        break
-                    if item[4] not in selected_ids:
-                        selected.append(item)
-                        selected_ids.add(item[4])
-                for item in candidates:
-                    if len(selected) >= self.config.force_max_jobs:
-                        break
-                    if item[4] not in selected_ids:
-                        selected.append(item)
-                        selected_ids.add(item[4])
-                candidates = selected
-            else:
-                candidates = candidates[:self.config.force_max_jobs]
-            if not candidates:
-                continue
-            affected_missing: set[int] = set()
-            moved_round = 0
-            cancelled = False
-            for _, _, _, _, job_id, guide, affected in candidates:
-                if progress and progress(iteration, self.config.force_iterations,
-                                         f'Force refinement {iteration}: {self.jobs_by_id[job_id].net}') is False:
-                    cancelled = True
-                    break
-                affected_missing.update(affected)
-                job = self.jobs_by_id[job_id]
-                old_path = self.routes[job_id]
-                control_guides[job_id] = guide
-                control_ghosts[job_id] = affected
-                self._remove(job_id)
-                self.force_guides[job_id] = guide
-                try:
-                    bounds = self._guide_bounds(job, max(self.config.guide_margin, 4 * self.step))
-                    path = self._astar(job, bounds, present_factor, True)
-                    if path is None:
-                        path = self._astar(job, (0, self.cols - 1, 0, self.rows - 1),
-                                           present_factor, True)
-                finally:
-                    self.force_guides.pop(job_id, None)
-                self._commit(job, path if path is not None else old_path)
-                moved_round += path is not None and path != old_path
-                if path is not None and path != old_path:
-                    control_guides.pop(job_id, None)
-                    control_ghosts.pop(job_id, None)
-            if cancelled:
-                self._restore_routes(original_routes)
-                return original_failed, iterations_run, 0, True
-            # Revisit only missing connections whose airwires exerted force.
-            for job_id in sorted(affected_missing,
-                                 key=lambda item: (math.dist(self.jobs_by_id[item].start,
-                                                             self.jobs_by_id[item].goal), item))[:8]:
-                if job_id not in failed:
-                    continue
-                job = self.jobs_by_id[job_id]
-                path = self._route_job(job, present_factor, True)
-                if path is not None:
-                    self._commit(job, path)
-                    failed.remove(job_id)
-            conflict_cells, _ = self._conflicts()
-            wires = self._unique_wire_runs()
-            crossings = self._geometric_crossings(wires)
-            if conflict_cells or crossings:
-                self._restore_routes(snapshot)
-                failed = old_failed
-                break
-            new_energy = self._force_state_energy(failed)
-            if (len(failed) > len(old_failed) or
-                    (len(failed) == len(old_failed) and moved_round and
-                     (new_energy >= old_energy - 1e-6 or
-                      self._emitted_length() > original_length * 1.03))):
-                self._restore_routes(snapshot)
-                failed = old_failed
-            else:
-                moved_total += moved_round
-                remember_best()
-        # Later rounds can be useful intermediate steps, but the emitted board
-        # is the shortest legal state with the highest completion seen so far.
-        self._restore_routes(best_routes)
-        return best_failed, iterations_run, best_moved, False
+        """Compact all board trace nets geometrically, without routing jobs."""
+        from .compaction import compact
+        iterations, moved, cancelled = compact(self, progress)
+        return set(failed), iterations, moved, cancelled
 
     def _detailed_astar(self, job: RoutingJob) -> list[Cell] | None:
         """Route against actual copper, without negotiated/history penalties."""
@@ -2244,6 +2116,8 @@ class Autorouter:
         report.failed = [{"job": job.id, "net": job.net,
                           "reason": reasons.get(job.id, "not routed")}
                          for job in self.jobs if job.id not in self.routes]
+        report.wire_updates = [{"index": index, "wire": wire} for index, wire in sorted(self.wire_updates.items())]
+        report.compaction_results = self.compaction_results
         report.wire_length = round(report.wire_length, 3)
         report.elapsed_seconds = round(time.monotonic() - started, 3)
         update(len(self.jobs), "Routing complete")

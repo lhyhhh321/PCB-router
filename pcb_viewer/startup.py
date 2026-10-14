@@ -54,15 +54,15 @@ def main():
                         help='Refine/rip up after each N initial jobs (0 disables; default: 192)')
     parser.add_argument('--force-iterations', '--combined-iterations',
                         dest='force_iterations', type=int, default=6,
-                        help='Combined straighten/repair/balance iterations (0 disables; default: 6)')
+                        help='Board force-compaction iterations (0 disables; default: 6)')
     parser.add_argument('--force-max-jobs', type=int, default=12,
-                        help='Maximum movable routes per force round (default: 12)')
+                        help='Legacy force budget (0 disables; positive values compact all trace nets)')
     parser.add_argument('--detailed-max-passes', type=int, default=32,
                         help='Detailed straighten/drag passes (0 disables; default: 32)')
     parser.add_argument('--detailed-drag-states', type=int, default=12,
                         help='Bounded segment-slide search states per missed connection (0 disables; default: 12)')
-    parser.add_argument('--attraction-strength', type=float, default=0.5,
-                        help='Inter-net spacing attraction (0 disables; default: 0.5)')
+    parser.add_argument('--attraction-strength', type=float, default=1.0,
+                        help='Board-wide inter-net spacing attraction (0 disables; default: 1.0)')
     parser.add_argument('--max-detour-ratio', type=float, default=3.0,
                         help='Reject extreme route stretch after repair (0 disables; default: 3)')
     parser.add_argument('--ordering', choices=('dense_first', 'short'), default='dense_first',
@@ -123,6 +123,8 @@ def main():
                              progress, args.freerouting_timeout, args.java)
                              if args.algorithm == 'freerouting' else
                              autoroute_data(document.data, config, progress))
+            for change in report.wire_updates:
+                document.data['wires'][change['index']] = change['wire']
             if args.resume:
                 document.data['wires'] = [wire for wire in document.data.get('wires', [])
                     if not (wire.get('route_type') == 'autoroute' and

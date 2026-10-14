@@ -659,7 +659,7 @@ class MainWindow(QMainWindow):
             item.setToolTip(f'Provisional route: {job.net} (connection {job.id})')
             length = sum(math.dist(a, b) for a, b in zip(points, points[1:]))
             self._routing_preview_items[job_id] = (signature, item, length)
-        routed = set(router.routes)
+        routed = set(router.routes) & {job.id for job in router.jobs}
         if self.show_unrouted.isChecked():
             for job_id in list(self._routing_preview_airwires):
                 if job_id in routed:
@@ -852,7 +852,7 @@ class MainWindow(QMainWindow):
         early_row.addWidget(early_interval)
         layout.addLayout(early_row)
         force_row = QHBoxLayout()
-        force_label = QLabel('Straighten + repair + balance iterations (built-in; 0 disables)')
+        force_label = QLabel('Board force-compaction iterations (0 disables)')
         force_row.addWidget(force_label)
         force_iterations = QSpinBox()
         force_iterations.setRange(0, 20)
@@ -876,13 +876,13 @@ class MainWindow(QMainWindow):
         drag_row.addWidget(drag_states)
         layout.addLayout(drag_row)
         attraction_row = QHBoxLayout()
-        attraction_label = QLabel('Inter-net attraction (0 disables)')
+        attraction_label = QLabel('Board-net attraction (0 disables)')
         attraction_row.addWidget(attraction_label)
         attraction_strength = QDoubleSpinBox()
         attraction_strength.setRange(0.0, 2.0)
         attraction_strength.setDecimals(2)
         attraction_strength.setSingleStep(0.1)
-        attraction_strength.setValue(0.5)
+        attraction_strength.setValue(1.0)
         attraction_row.addWidget(attraction_strength)
         layout.addLayout(attraction_row)
         detour_row = QHBoxLayout()
@@ -930,8 +930,11 @@ class MainWindow(QMainWindow):
             return
 
         scratch = copy.deepcopy(self.document.data)
+        scratch_wire_indices = list(range(len(scratch.get('wires', []))))
         resume_enabled = resume.isChecked() and algorithm.currentIndex() == 0
         if not resume_enabled:
+            scratch_wire_indices = [i for i, wire in enumerate(scratch.get('wires', []))
+                                    if wire.get('route_type') != 'autoroute']
             scratch['wires'] = [wire for wire in scratch.get('wires', [])
                                 if wire.get('route_type') != 'autoroute']
         scratch.pop('autoroute_report', None)
@@ -991,7 +994,7 @@ class MainWindow(QMainWindow):
         def visualize(router, round_number, total_rounds, message):
             if self.document is not routing_document:
                 return
-            preview_count[0] = (len(router.routes), len(router.jobs))
+            preview_count[0] = (sum(job.id in router.routes for job in router.jobs), len(router.jobs))
             self._draw_routing_preview(router, round_number, total_rounds, message)
         def update(done, total, message):
             if self.document is not routing_document:
@@ -1040,7 +1043,9 @@ class MainWindow(QMainWindow):
         generated = [index for index, wire in enumerate(existing)
                      if wire.get('route_type') == 'autoroute' and
                      (not resume_enabled or wire.get('layer', self.document.data.get('layer')) == report.layer)]
-        changes = [('wires', index, None) for index in reversed(generated)]
+        changes = [('wires', scratch_wire_indices[change['index']], change['wire'])
+                   for change in report.wire_updates]
+        changes.extend(('wires', index, None) for index in reversed(generated))
         base = len(existing) - len(generated)
         changes.extend(('wires', base + index, wire) for index, wire in enumerate(wires))
         self.document.batch_change(changes)
@@ -1075,8 +1080,8 @@ class MainWindow(QMainWindow):
                                f'{result["after"]["conflict_cells"]} conflicts')
             detail += (f'\nEarly refinement: {report.early_refinement_passes} checkpoints, '
                        f'{report.early_refinement_moves} accepted moves.'
-                       f'\nCombined straighten/repair/balance: {report.force_iterations_run} iterations, '
-                       f'{report.force_jobs_moved} accepted route moves, '
+                       f'\nBoard force compaction: {report.force_iterations_run} iterations, '
+                       f'{report.force_jobs_moved} moved traces (including existing board copper), '
                        f'{report.force_new_connections:+d} net connection change.')
             detail += (f'\nDetailed routing: {report.detailed_passes} passes, '
                        f'{report.detailed_straightened} straightened traces, '

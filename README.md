@@ -47,7 +47,7 @@ python -m pcb_viewer --autoroute \
   --output /tmp/pcb-routed.json --grid 2 --iterations 6 \
   --early-refine-interval 192 --combined-iterations 6 \
   --detailed-max-passes 32 --detailed-drag-states 12 \
-  --attraction-strength 0.5 \
+  --attraction-strength 1.0 \
   --random-rounds 1 --random-seed 0 \
   --max-detour-ratio 3
 
@@ -237,3 +237,11 @@ Mismatched IDs/nets or fragments that do not connect both terminals produce an
 error instead of being counted as completed or silently discarded. Ordinary
 untagged wires remain fixed copper. Resume is available for the built-in router;
 Freerouting retains its existing fresh-run behavior.
+
+Attraction now includes every nearby foreign net represented by copper on the
+active routing layer: fixed wires, pads, pins, vias, and pours, as well as
+generated routes. A net contributes once across fixed and generated geometry.
+The default attraction strength is **1.0**, doubled from 0.5; the configurable
+range remains 0–2, with 0 disabling attraction. Same-net copper, keepouts, and
+other-layer copper do not attract. The existing finite attraction range,
+missing-airwire protection, displacement cap, and hard legality checks remain.
