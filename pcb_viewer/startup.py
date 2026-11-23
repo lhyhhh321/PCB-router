@@ -51,7 +51,7 @@ def main():
     parser.add_argument('--iterations', type=int, default=6,
                         help='Initial congestion-repair passes (default: 6)')
     parser.add_argument('--early-refine-interval', type=int, default=192,
-                        help='Refine/rip up after each N initial jobs (0 disables; default: 192)')
+                        help='Try legal reroutes after each N initial jobs (0 disables; default: 192)')
     parser.add_argument('--force-iterations', '--combined-iterations',
                         dest='force_iterations', type=int, default=6,
                         help='Board force-compaction iterations (0 disables; default: 6)')

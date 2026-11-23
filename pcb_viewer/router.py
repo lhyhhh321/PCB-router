@@ -14,7 +14,7 @@ import itertools
 import math
 import random
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 
 Point = tuple[float, float]
@@ -43,13 +43,13 @@ class RouterConfig:
     guide_margin: float = 40.0
     boundary_margin: float = 180.0
     bend_penalty: float = 0.35
-    present_congestion_cost: float = 24.0
+    present_congestion_cost: float = 8.0
     history_cost: float = 5.0
     max_expansions: int = 250_000
     layer: str | None = None
     use_routing_guides: bool = False
     guide_cost: float = 0.8
-    hard_avoidance: bool = True
+    hard_avoidance: bool = True  # Try legal paths first when repairing existing conflicts.
     max_shove_blockers: int = 4
     short_routes_first: bool = True
     ordering: str = "dense_first"
@@ -263,6 +263,68 @@ def extract_jobs(data: dict, layer: str | None = None) -> list[RoutingJob]:
     return jobs
 
 
+class _TraceIndex:
+    """Index physical trace segments for centerline checks during grid search."""
+
+    def __init__(self, step: float):
+        self.bucket_size = 8 * step
+        self.buckets: dict[Cell, dict[tuple[str | None, int | None], set[tuple[Point, Point]]]] = {}
+        self.footprints: dict[tuple[str | None, int | None], set[Cell]] = {}
+
+    def _keys(self, a: Point, b: Point) -> Iterable[Cell]:
+        size = self.bucket_size
+        ax, ay = math.floor(a[0] / size), math.floor(a[1] / size)
+        bx, by = math.floor(b[0] / size), math.floor(b[1] / size)
+        for y in range(min(ay, by), max(ay, by) + 1):
+            for x in range(min(ax, bx), max(ax, bx) + 1):
+                yield x, y
+
+    def add(self, net: str | None, job_id: int | None, points: Iterable[Point]) -> None:
+        owner = net, job_id
+        footprint = self.footprints.setdefault(owner, set())
+        for a, b in itertools.pairwise(points):
+            # Walk long segments in bucket-sized steps to avoid indexing the
+            # entire bounding rectangle of a long diagonal fixed wire.
+            parts = max(1, math.ceil(max(abs(a[0] - b[0]), abs(a[1] - b[1])) /
+                                     self.bucket_size))
+            previous = a
+            for i in range(1, parts + 1):
+                end = b if i == parts else (a[0] + (b[0] - a[0]) * i / parts,
+                                            a[1] + (b[1] - a[1]) * i / parts)
+                for key in self._keys(previous, end):
+                    self.buckets.setdefault(key, {}).setdefault(owner, set()).add((a, b))
+                    footprint.add(key)
+                previous = end
+
+    def remove(self, net: str, job_id: int) -> None:
+        owner = net, job_id
+        for key in self.footprints.pop(owner, ()):
+            users = self.buckets[key]
+            del users[owner]
+            if not users:
+                del self.buckets[key]
+
+    @staticmethod
+    def _intersects(a: Point, b: Point, c: Point, d: Point) -> bool:
+        if (max(a[0], b[0]) < min(c[0], d[0]) or max(c[0], d[0]) < min(a[0], b[0]) or
+                max(a[1], b[1]) < min(c[1], d[1]) or max(c[1], d[1]) < min(a[1], b[1])):
+            return False
+
+        def side(p: Point, q: Point, r: Point) -> float:
+            return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+        s1, s2 = side(a, b, c), side(a, b, d)
+        s3, s4 = side(c, d, a), side(c, d, b)
+        return (s1 <= 0 <= s2 or s2 <= 0 <= s1) and (s3 <= 0 <= s4 or s4 <= 0 <= s3)
+
+    def intersections(self, a: Point, b: Point, net: str) -> Iterator[tuple[str | None, int | None]]:
+        if self.buckets:
+            for key in self._keys(a, b):
+                for owner, segments in self.buckets.get(key, {}).items():
+                    if owner[0] != net and any(self._intersects(a, b, c, d) for c, d in segments):
+                        yield owner
+
+
 class Autorouter:
     """DRC-aware octilinear maze router with negotiated congestion."""
 
@@ -309,6 +371,7 @@ class Autorouter:
         self.diagonal_usage: dict[Cell, dict[int, int]] = {}
         self.diagonal_footprints: dict[int, set[Cell]] = {}
         self.routes: dict[int, list[Cell]] = {}
+        self.route_traces = _TraceIndex(self.step)
         self.history: dict[int, int] = {}
         self.force_guides: dict[int, tuple[Point, ...]] = {}
         self.jobs_by_id = {job.id: job for job in self.jobs}
@@ -397,9 +460,9 @@ class Autorouter:
             self._commit(job, cells)
 
     def _build_region(self) -> None:
-        routing_points = [point for job in self.jobs
-                          for point in ((job.guide if self.config.use_routing_guides and job.guide
-                                         else (job.start, job.goal)))]
+        routing_points = [point for job in self.jobs for point in (job.start, job.goal)]
+        if self.config.use_routing_guides:
+            routing_points.extend(point for job in self.jobs for point in job.guide)
         routing_points.extend(tuple(point) for wire in self.resume_wires
                               for point in wire.get("points", []))
         if self.config.stage_enabled("combined"):
@@ -504,6 +567,7 @@ class Autorouter:
         return (not obj_layer or obj_layer == self.layer) and (not layers or self.layer in layers)
 
     def _rasterize_board(self) -> None:
+        self.fixed_traces = _TraceIndex(self.step)
         # Fixed copper and terminals are obstacles to other nets, but conductive
         # access geometry for their own net.
         for group in ("pins", "pads", "vias"):
@@ -532,6 +596,7 @@ class Autorouter:
             owner = obj.get("net") if isinstance(obj.get("net"), str) else None
             radius = max(0.0, _number(obj.get("width"), 2.0) / 2)
             points = obj.get("points", [])
+            self.fixed_traces.add(owner, None, map(tuple, points))
             for a, b in zip(points, points[1:]):
                 self._mark_segment(tuple(a), tuple(b), radius, owner)
         for obj in self.data.get("keepouts", []):
@@ -608,9 +673,11 @@ class Autorouter:
                 if other_orientation != orientation and
                 self.jobs_by_id[other_id].net != job.net}
 
-    def _dynamic_cost(self, cell: Cell, job: RoutingJob, present_factor: float) -> float:
-        conflicts, historical = self._dynamic_cost_parts(cell, job)
-        return present_factor * conflicts + self.config.history_cost * historical
+    def _trace_edge_clear(self, a: Point, b: Point, job: RoutingJob,
+                          hard_avoidance: bool) -> bool:
+        return (next(self.fixed_traces.intersections(a, b, job.net), None) is None and
+                (not hard_avoidance or
+                 next(self.route_traces.intersections(a, b, job.net), None) is None))
 
     def _guide_bounds(self, job: RoutingJob, margin: float) -> tuple[int, int, int, int]:
         guide = (self.force_guides.get(job.id) or
@@ -632,8 +699,11 @@ class Autorouter:
                present_factor: float, hard_avoidance: bool = False,
                history_weight: float | None = None) -> list[Cell] | None:
         start, goal = self._cell(job.start), self._cell(job.goal)
+        if hard_avoidance and self._dynamic_cost_parts(start, job)[0]:
+            return None
         if start == goal:
-            return [start]
+            return ([start] if self._trace_edge_clear(job.start, job.goal, job, hard_avoidance)
+                    else None)
         x1, x2, y1, y2 = bounds
         counter = itertools.count()
         best = {start: 0.0}
@@ -646,6 +716,8 @@ class Autorouter:
         expansions = 0
         found = False
         fields = None
+        weight = ((0.0 if hard_avoidance else self.config.history_cost)
+                  if history_weight is None else history_weight)
         while queue and expansions < self.config.max_expansions:
             _, _, cost, cell, old_direction = heapq.heappop(queue)
             if cost != best.get(cell) or old_direction != incoming.get(cell):
@@ -669,8 +741,6 @@ class Autorouter:
                     legal_cache[nxt] = legal
                 if not legal:
                     continue
-                move = math.sqrt(2) if dx and dy else 1.0
-                bend = self.config.bend_penalty if old_direction >= 0 and old_direction != direction else 0.0
                 dynamic_parts = dynamic_cache.get(nxt)
                 if dynamic_parts is None:
                     if fields is None:
@@ -683,11 +753,8 @@ class Autorouter:
                 conflicts += len(self._diagonal_blockers(cell, nxt, job))
                 if hard_avoidance and conflicts:
                     continue
-                # History helps negotiate conflicts, but must not force a
-                # conflict-free final path into a huge detour.
-                weight = (0.0 if hard_avoidance else self.config.history_cost)
-                if history_weight is not None:
-                    weight = history_weight
+                move = math.sqrt(2) if dx and dy else 1.0
+                bend = self.config.bend_penalty if old_direction >= 0 and old_direction != direction else 0.0
                 dynamic = present_factor * conflicts + weight * historical
                 guide_cost = guide_cache.get(nxt)
                 if guide_cost is None:
@@ -695,6 +762,10 @@ class Autorouter:
                     guide_cache[nxt] = guide_cost
                 new_cost = cost + move + bend + dynamic + guide_cost
                 if new_cost + 1e-12 < best.get(nxt, math.inf):
+                    a = job.start if cell == start else self._point(cell)
+                    b = job.goal if nxt == goal else self._point(nxt)
+                    if not self._trace_edge_clear(a, b, job, hard_avoidance):
+                        continue
                     best[nxt] = new_cost
                     incoming[nxt] = direction
                     previous[nxt] = cell
@@ -763,24 +834,24 @@ class Autorouter:
                 error += dx
                 y += sy
 
-    def _guided_pattern(self, job: RoutingJob, present_factor: float) -> list[Cell] | None:
-        if not self.config.use_routing_guides or len(job.guide) < 2:
-            return None
+    def _pattern_legal(self, job: RoutingJob, path: list[Cell], avoid_history: bool) -> bool:
+        for index, cell in enumerate(path):
+            conflicts, historical = self._dynamic_cost_parts(cell, job)
+            if (not self._static_legal(cell, job, index in (0, len(path) - 1)) or
+                    conflicts or (avoid_history and historical) or
+                    (index and self._diagonal_blockers(path[index - 1], cell, job))):
+                return False
+        return all(self._trace_edge_clear(a, b, job, True)
+                   for a, b in itertools.pairwise(self._raw_points(job, path)))
+
+    def _guided_pattern(self, job: RoutingJob) -> list[Cell]:
         coarse = self.coarse_guides[job.id]
-        waypoints = [self._cell(point) for point in coarse]
+        waypoints = [self._cell(job.start), *(self._cell(point) for point in coarse[1:-1]),
+                     self._cell(job.goal)]
         path: list[Cell] = []
         for a, b in zip(waypoints, waypoints[1:]):
             segment = self._grid_line(a, b)
             path.extend(segment if not path else segment[1:])
-        if not path:
-            return None
-        for index, cell in enumerate(path):
-            if not self._static_legal(cell, job, index in (0, len(path) - 1)):
-                return None
-            if self._dynamic_cost(cell, job, present_factor):
-                return None
-            if index and self._diagonal_blockers(path[index - 1], cell, job):
-                return None
         return path
 
     def _pattern_paths(self, job: RoutingJob) -> Iterable[list[Cell]]:
@@ -802,40 +873,15 @@ class Autorouter:
             if path[-1] == goal:
                 yield path
 
-    def _pattern_route(self, job: RoutingJob) -> list[Cell] | None:
-        best_path = None
-        best_cost = math.inf
-        for path in self._pattern_paths(job):
-            cost = 0.0
-            old_direction = None
-            valid = True
-            for index, cell in enumerate(path[1:], 1):
-                if not self._static_legal(cell, job, cell == path[-1]):
-                    valid = False
-                    break
-                previous = path[index - 1]
-                direction = (cell[0] - previous[0], cell[1] - previous[1])
-                if old_direction is not None and old_direction != direction:
-                    cost += self.config.bend_penalty
-                old_direction = direction
-                cost += (math.sqrt(2) if direction[0] and direction[1] else 1.0)
-                cost += self._dynamic_cost(cell, job, self.config.present_congestion_cost)
-                cost += self.config.present_congestion_cost * len(
-                    self._diagonal_blockers(previous, cell, job))
-            if valid and cost < best_cost:
-                best_path, best_cost = path, cost
-        return best_path
-
     def _route_job(self, job: RoutingJob, present_factor: float,
                    hard_avoidance: bool = False) -> list[Cell] | None:
-        guided = self._guided_pattern(job, present_factor)
-        if guided is not None:
-            return guided
-        pattern = self._pattern_route(job) if not (self.config.use_routing_guides and job.guide) else None
-        if (pattern is not None and
-                not any(self._dynamic_cost(cell, job, present_factor) for cell in pattern) and
-                not any(self._diagonal_blockers(a, b, job) for a, b in zip(pattern, pattern[1:]))):
-            return pattern
+        patterns = ((self._guided_pattern(job),)
+                    if self.config.use_routing_guides and len(job.guide) >= 2
+                    else self._pattern_paths(job))
+        avoid_history = not hard_avoidance and self.config.history_cost > 0
+        for path in patterns:
+            if self._pattern_legal(job, path, avoid_history):
+                return path
         # Increasing guide boxes mimic detailed-route guide relaxation.
         margins = [self.config.guide_margin,
                    max(self.config.guide_margin * 2.5, 100.0),
@@ -881,6 +927,7 @@ class Autorouter:
                 self.diagonal_usage.setdefault(square, {})[job.id] = orientation
                 diagonals.add(square)
         self.routes[job.id] = path
+        self.route_traces.add(job.net, job.id, self._raw_points(job, path))
         self.footprints[job.id] = footprint
         self.diagonal_footprints[job.id] = diagonals
 
@@ -891,7 +938,8 @@ class Autorouter:
                 users.discard(job_id)
                 if not users:
                     del self.usage[key]
-        self.routes.pop(job_id, None)
+        if self.routes.pop(job_id, None) is not None:
+            self.route_traces.remove(self.jobs_by_id[job_id].net, job_id)
         for square in self.diagonal_footprints.pop(job_id, ()):
             users = self.diagonal_usage.get(square)
             if users:
@@ -906,6 +954,9 @@ class Autorouter:
             blockers.update(conflicts)
             if index:
                 blockers.update(self._diagonal_blockers(path[index - 1], cell, job))
+        for a, b in itertools.pairwise(self._raw_points(job, path)):
+            blockers.update(other_id for _, other_id in self.route_traces.intersections(a, b, job.net)
+                            if other_id is not None)
         return blockers
 
     def _conflict_details(self) -> tuple[set[int], set[tuple[int, int]]]:
@@ -1073,17 +1124,22 @@ class Autorouter:
         """Try local route swaps while preserving zero-crossing output."""
         if not self.config.max_shove_blockers:
             return failed
+        probe_factor = self.config.present_congestion_cost
         for job_id in sorted(failed,
                              key=lambda item: (math.dist(self.jobs_by_id[item].start,
                                                          self.jobs_by_id[item].goal), item)):
             job = self.jobs_by_id[job_id]
-            candidate = self._route_job(job, present_factor)
+            candidate = self._route_job(job, probe_factor)
             if candidate is None and self.config.reverse_escape:
-                candidate = self._route_reversed(job, present_factor, False)
+                candidate = self._route_reversed(job, probe_factor, False)
             if candidate is None:
                 continue
             blockers = self._path_blockers(job, candidate)
-            if not 0 < len(blockers) <= self.config.max_shove_blockers:
+            if len(blockers) > self.config.max_shove_blockers:
+                continue
+            if not blockers:
+                self._commit(job, candidate)
+                failed.remove(job_id)
                 continue
             old_paths = {other_id: self.routes[other_id] for other_id in blockers}
             for other_id in blockers:
@@ -1436,6 +1492,7 @@ class Autorouter:
         self.diagonal_usage.clear()
         self.diagonal_footprints.clear()
         self.routes.clear()
+        self.route_traces = _TraceIndex(self.step)
         for job_id, path in snapshot.items():
             self._commit(self.jobs_by_id[job_id], path)
 
@@ -1447,12 +1504,7 @@ class Autorouter:
 
     def _refine_initial_routes(self, failed: set[int],
                                progress: Progress | None = None) -> tuple[set[int], bool]:
-        """Move a few congested routes before the remaining jobs are placed.
-
-        Unlike final refinement, this can run on a provisional board with
-        conflicts.  A move must not increase conflict cells or make an extreme
-        detour; the following rip-up pass can then use the freed corridor.
-        """
+        """Use legal moves to free corridors before the remaining jobs are placed."""
         if not self.config.force_max_jobs or len(self.routes) < 2:
             return set(), False
         missing = [self.jobs_by_id[job_id] for job_id in sorted(failed)]
@@ -1484,9 +1536,6 @@ class Autorouter:
                                                      4 * self.step))
                 path = self._astar(job, bounds, self.config.present_congestion_cost,
                                    True)
-                if path is None:
-                    path = self._astar(job, bounds,
-                                       self.config.present_congestion_cost, False)
             finally:
                 self.force_guides.pop(job_id, None)
             self._commit(job, path if path is not None else old_path)
@@ -1768,7 +1817,10 @@ class Autorouter:
         return failed, passes, straightened_total, dragged_total, False
 
     def _polyline(self, job: RoutingJob, cells: list[Cell]) -> list[list[float]]:
-        points = self._raw_points(job, cells)
+        return self._simplify_polyline(self._raw_points(job, cells))
+
+    @staticmethod
+    def _simplify_polyline(points: Iterable[Point]) -> list[list[float]]:
         deduped: list[Point] = []
         for point in points:
             rounded = (round(point[0], 6), round(point[1], 6))
@@ -1818,15 +1870,9 @@ class Autorouter:
             def flush() -> None:
                 if len(run) < 2:
                     return
-                # Reuse the collinear simplifier on arbitrary run endpoints.
-                fragment = RoutingJob(job.id, job.net, run[0], run[-1],
-                                      job.width, job.layer)
-                points = self._polyline(fragment, [self._cell(p) for p in run])
-                # _polyline snaps interior points to the grid; raw interior
-                # points are already on-grid by construction.
                 wire = {"layer": job.layer, "width": job.width,
                         "net": job.net, "route_type": "autoroute",
-                        "points": points, "autoroute_job": job.id,
+                        "points": self._simplify_polyline(run), "autoroute_job": job.id,
                         "autoroute_jobs": [job.id]}
                 wires.append(wire)
                 for edge in run_edges:
@@ -1948,10 +1994,7 @@ class Autorouter:
                     if not update(done, f"Initial routing: {job.net}"):
                         report.cancelled = True
                         break
-                    path = (self._route_job(job, self.config.present_congestion_cost, True)
-                            if self.config.hard_avoidance else None)
-                    if path is None:
-                        path = self._route_job(job, self.config.present_congestion_cost)
+                    path = self._route_job(job, self.config.present_congestion_cost, True)
                     if path is None:
                         report.failed.append({"job": job.id, "net": job.net, "reason": "no path"})
                     else:
@@ -1963,27 +2006,18 @@ class Autorouter:
                             placed < len(ordered)):
                         with measure("early_refinement"):
                             checkpoint = {job_id: list(route) for job_id, route in self.routes.items()}
-                            checkpoint_history = dict(self.history)
-                            before_conflicts = len(self._conflicts()[0])
                             missing_so_far = {earlier.id for earlier in ordered[:placed]
                                               if earlier.id not in self.routes}
                             moved, cancelled = self._refine_initial_routes(
                                 missing_so_far,
                                 lambda _local, _total, message: update(done, message),
                             )
-                            if not cancelled and moved:
-                                _, cancelled = self._ripup_and_reroute(
-                                    0, lambda _local, _total, message: update(done, message),
-                                    label='Early rip-up/reroute', focus_jobs=moved)
                             report.early_refinement_passes += 1
-                            if cancelled or len(self._conflicts()[0]) > before_conflicts:
+                            if cancelled:
                                 self._restore_routes(checkpoint)
-                                self.history = checkpoint_history
-                                if cancelled:
-                                    report.cancelled = True
-                                    break
-                            else:
-                                report.early_refinement_moves += len(moved)
+                                report.cancelled = True
+                                break
+                            report.early_refinement_moves += len(moved)
 
         if self.config.stage_enabled("repair") and not report.cancelled:
             with measure("repair"):
@@ -2009,13 +2043,7 @@ class Autorouter:
 
                 current_conflicts, _ = self._conflicts()
                 if len(current_conflicts) > best_conflict_count:
-                    self.usage.clear()
-                    self.footprints.clear()
-                    self.diagonal_usage.clear()
-                    self.diagonal_footprints.clear()
-                    self.routes.clear()
-                    for job_id, path in best_routes.items():
-                        self._commit(self.jobs_by_id[job_id], path)
+                    self._restore_routes(best_routes)
 
         if self.config.strict_final and not report.cancelled:
             failed_final = {job.id for job in self.jobs if job.id not in self.routes}

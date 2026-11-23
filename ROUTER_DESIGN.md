@@ -13,7 +13,7 @@ The corresponding TritonRoute/OpenROAD stages are documented in the official [Op
 | Track assignment | Try a legal octilinear guide/pattern route before invoking maze search. |
 | Global initial route | Route the densest pin neighborhoods first (or choose faster short-route-first ordering), using 8-neighbor A*. |
 | Randomized order trials | Run the baseline priority order and independently rerun with seeded, bounded rank jitter. Select the cleanest and most complete result, then shorter copper. |
-| Early refinement checkpoints | After every configured batch of initial jobs, move a few force-affected routes and call the reusable rip-up/reroute pass before placing more jobs. |
+| Early refinement checkpoints | After each configured batch of initial jobs, try legal force-guided reroutes before placing more jobs. |
 | DRC model | Inflate traces by half-width plus clearance; block foreign-net pads, vias, traces, pours, and wire keepouts. Same-net copper remains accessible. |
 | Search and repair | Identify foreign-net trace-spacing conflicts, rip up implicated routes, and reroute with increasing present and historical congestion costs. Retain the best iteration. |
 | Final legalization | Keep a conflict-free subset, retry removed connections with hard avoidance, try small route swaps, and reject any remaining geometric intersections. An optional reverse-direction pin escape can be enabled programmatically. |
@@ -57,13 +57,13 @@ movement + bend_penalty
          + optional_guide_factor * distance_from_explicit_guide
 ```
 
-Fixed geometry is a hard constraint. Already-routed traces are negotiated congestion: crossing them is costly rather than initially impossible, allowing a complete candidate solution to be constructed before repair. Each initial congestion-repair pass increases the present cost, increments history around violations, and keeps the lowest-conflict solution seen. This rip-up/reroute pass is a reusable method called both at early checkpoints and in the main negotiation loop. For up to two stalled jobs per pass, it tests a force-displaced guide and keeps the guided candidate only when its blocker count or tied length improves within a bounded stretch. Once hard avoidance is active, historical congestion cost is omitted: a legal short path should not be displaced by old violations that no longer exist.
+Initial patterns and maze searches treat fixed geometry and existing foreign-net routes as hard constraints. They check grid occupancy, opposing diagonal steps, and physical trace intersections, including those involving off-grid terminal segments. An initial job with no legal path stays unrouted. Later soft searches can probe corridors through movable copper with a default present congestion cost of 8 per conflicting route. Missing-route swap probes use that base cost, and all replacement routes must pass hard avoidance. When a resumed board contains raster violations, each congestion-repair pass increases the present cost, increments history around violations, and retains the lowest-conflict solution seen. For up to two stalled jobs per pass, it tests a force-displaced guide and keeps the guided candidate only when its blocker count or tied length improves within a bounded stretch. Hard-avoidance searches omit historical congestion cost.
 
 Output polylines retain exact source/target coordinates, collapse collinear grid points, and are tagged with `route_type: "autoroute"` and `autoroute_job`. When two same-net requests share a grid edge, that copper is emitted once. Output may therefore contain several fragments for one request, or no new fragment when its entire path is already conductive. `autoroute_jobs` on a shared fragment records all covered request IDs; `report.routed` counts connected requests rather than wire records.
 
 ## Global-stage early and iterative force refinement
 
-During initial placement, `early_refine_interval` (default 192 attempted jobs, 0 disables) triggers checkpoints before all jobs have been attempted. Each checkpoint samples existing routes, prioritizes those near conflicts or airwires of requests already missing, and tries a small number of force-guided maze reroutes. Because the initial board may still have negotiated conflicts, a move is accepted only when it lowers conflict cells without a severe length penalty, or lowers repulsion/length without increasing conflicts. The extracted rip-up/reroute method then repairs only conflicts involving the accepted early moves; unrelated provisional routes are left for the normal repair passes. A checkpoint that worsens the conflict count is rolled back before initial placement continues. The report records checkpoint and accepted-move counts. These early and ordinary rip-up guides remain repulsion-only; attraction is applied only in the later combined iterations, where a legal-state rollback is available.
+During initial placement, `early_refine_interval` (default 192 attempted jobs, 0 disables) triggers checkpoints before all jobs have been attempted. Each checkpoint samples existing routes, prioritizes those near airwires of missing requests or conflicts in resumed copper, and tries a small number of legal force-guided maze reroutes. It accepts a move that lowers repulsion or length within its stretch bounds, or reduces conflicts in resumed copper. The report records checkpoint and accepted-move counts. Early and ordinary rip-up guides use repulsion. Attraction is applied in the later combined iterations, where a legal-state rollback is available.
 
 After initial maze-routing, congestion repair, and legalization, the combined loop runs up to six iterations by default. **Each iteration has three phases:** first straighten legal zigzags; next retry missing requests and try bounded local swaps that shorten already-connected detours; then perform force/gradient refinement. The detour phase probes a shorter low-congestion path, identifies its actual blockers, temporarily removes at most four of them, and commits the swap only when all displaced routes can be rebuilt legally and total emitted copper length decreases. Straightening examines a bounded number of the bendiest routes and replaces local subpaths with one-bend octilinear patterns. It keeps endpoints fixed, rejects foreign-net clearance or crossing violations, requires fewer bends without increasing path or emitted board length, and rolls back any invalid change. The refinement phase samples at most 20 points along each routed connection, never moving the exact two terminals. For a sampled point `p`, nearby foreign-net route cells repel it inside the preferred separation and weakly attract it in a finite band outside that separation. Attraction is counted once per foreign net, not once per connection; missing connections' straight airwires only repel, preserving corridor room. A weak spring term pulls toward the midpoint of adjacent samples. In conceptual form, the update is a clipped gradient step on
 
@@ -162,10 +162,10 @@ to every selected stage that uses them. A disabled top-level repair stage does
 not disable local repair inside a selected early or combined stage.
 
 Final read-only clearance and geometric crossing checks are unconditional.
-Final crossing *removal* belongs to legalization and is skipped if that stage
-is omitted, preserving provisional results for ablation studies. Remaining
-geometric crossing pairs contribute to the final conflict count as well as
-raster conflict locations. No omitted stage is silently re-enabled.
+Final crossing removal belongs to legalization. Resumed boards can still
+contain pre-existing violations if legalization is omitted. Remaining geometric
+crossing pairs contribute to the final conflict count alongside raster
+conflict locations.
 
 Each executed stage visit adds a `stage_results` record containing before/after
 routed-request count, emitted length, raster conflict count, elapsed time, and

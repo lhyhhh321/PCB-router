@@ -67,18 +67,41 @@ def test_detailed_can_run_without_initial_or_legalization(board):
     assert [row['stage'] for row in report.stage_results] == ['detailed']
 
 
-def test_unlegalized_crossings_are_retained_and_reported(monkeypatch):
+@pytest.mark.parametrize('guided', [False, True])
+def test_initial_rejects_unavoidable_crossings_without_legalization(guided):
     board = {'routing_connections': [
-        {'net': 'A', 'layer': 'TOP', 'width': 1, 'start': [0, 10], 'end': [20, 10]},
-        {'net': 'B', 'layer': 'TOP', 'width': 1, 'start': [10, 0], 'end': [10, 20]},
+        {'net': 'A', 'layer': 'TOP', 'width': 1, 'start': [0, 10], 'end': [20, 10],
+         'guide': [[0, 10], [20, 10]]},
+        {'net': 'B', 'layer': 'TOP', 'width': 1, 'start': [10, 0], 'end': [10, 20],
+         'guide': [[10, 0], [10, 20]]},
     ]}
-    def direct(self, job, *_args):
-        return self._grid_line(self._cell(job.start), self._cell(job.goal))
-    monkeypatch.setattr(Autorouter, '_route_job', direct)
-    wires, report = autoroute_data(board, config(stages=('initial',)))
-    assert len(wires) == 2 and report.routed == 2
-    assert report.conflict_cells > 0 and report.conflicting_jobs == [0, 1]
-    assert not report.clean
+    wires, report = autoroute_data(
+        board, RouterConfig(grid_step=2, clearance=0, boundary_margin=0,
+                            use_routing_guides=guided, hard_avoidance=False,
+                            present_congestion_cost=0, stages=('initial', 'early_refinement'),
+                            early_refine_interval=1, strict_final=False))
+    assert len(wires) == report.routed == 1
+    assert len(report.failed) == 1
+    assert report.conflict_cells == 0
+    assert report.stage_results[-1]['after']['conflict_cells'] == 0
+
+
+@pytest.mark.parametrize('fixed', [False, True])
+def test_initial_routes_around_crossings_hidden_by_terminal_snapping(fixed):
+    start, end = [0.2, 0.49], [0.49, 0.4]
+    board = {'routing_connections': [
+        {'net': 'B', 'layer': 'TOP', 'width': 0.1, 'start': [0, 0.75], 'end': [0.75, 0]},
+    ]}
+    if fixed:
+        board['wires'] = [{'net': 'A', 'layer': 'TOP', 'width': 0.1, 'points': [start, end]}]
+    else:
+        board['routing_connections'].insert(0, {
+            'net': 'A', 'layer': 'TOP', 'width': 0.1, 'start': start, 'end': end})
+    wires, report = autoroute_data(
+        board, RouterConfig(grid_step=1, clearance=0, boundary_margin=0, stages=('initial',)))
+    assert report.clean
+    routed = next(wire for wire in wires if wire['net'] == 'B')
+    assert routed['points'] == [[0, 0.75], [1, 1], [0.75, 0]]
 
 
 def test_cancelled_initial_does_not_enter_later_stages(board):

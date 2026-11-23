@@ -67,12 +67,12 @@ def test_mismatched_saved_ids_are_rejected():
         Autorouter(data, RouterConfig(resume=True))
 
 
-def test_resume_preserves_off_grid_terminal_geometry():
+def test_resume_preserves_off_grid_trace_geometry():
     data = {'layer': 'TOP', 'routing_connections': [
         {'net': 'N', 'layer': 'TOP', 'width': 1, 'start': [0.1, 1], 'end': [10, 0]},
     ], 'wires': [{'net': 'N', 'layer': 'TOP', 'width': 1,
                   'route_type': 'autoroute', 'autoroute_job': 0, 'autoroute_jobs': [0],
-                  'points': [[0.1, 1], [2, 0], [10, 0]]}]}
+                  'points': [[0.1, 1], [2.1, 0.2], [10, 0]]}]}
     wires, report = autoroute_data(data, RouterConfig(resume=True, stages=()))
     assert wires == data['wires'] and report.routed == 1
 

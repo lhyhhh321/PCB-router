@@ -156,6 +156,22 @@ def test_initial_no_path_job_gets_final_shove_attempt():
     assert report.routed == 0 and len(report.failed) == 1
 
 
+def test_shove_probe_favors_short_corridor_with_removable_blocker():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'A', 'width': 0.5, 'start': [0, 0], 'end': [20, 0]},
+        {'net': 'B', 'width': 0.5, 'start': [10, -8], 'end': [10, 8]},
+    ]}
+    router = Autorouter(board, RouterConfig(grid_step=1, clearance=0, boundary_margin=15))
+    target, blocker = router.jobs
+    original = router._grid_line(router._cell(blocker.start), router._cell(blocker.goal))
+    router._commit(blocker, original)
+
+    assert router._shove_unrouted({target.id}, 24 * router.config.iterations) == set()
+    assert router._polyline(target, router.routes[target.id]) == [[0, 0], [20, 0]]
+    assert router.routes[blocker.id] != original
+    assert router._conflicts()[0] == set()
+
+
 def test_via_keepout_does_not_block_trace_but_wire_keepout_does():
     base = {
         'layer': 'TOP',

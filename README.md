@@ -65,7 +65,7 @@ The flow follows TritonRoute's broad architecture: pin/grid access, pattern rout
 
 The built-in flow has two stages. The existing ordered placement, congestion repair, legalization, and force iterations are global routing. Afterward, detailed routing models each routed connection as bend points joined by straight segments. In each pass it first removes legal bends, then runs hard-obstacle A* for unfinished connections. If A* cannot connect one, a soft probe ranks both blockers and nearby nonblocking traces. A bounded best-first search tests parallel slides of one interior segment at a time. The adjacent two segments remain on their original lines, all other segments are unchanged, and terminals stay fixed. Multiple nearby nets can be slid in successive search steps. Every trial checks obstacles and clearance; the entire search rolls back unless the unfinished connection routes with no conflicts or crossings. Passes stop at a fixed point or `--detailed-max-passes 32` (0 disables the stage); `--detailed-drag-states 12` bounds the search (0 disables dragging). The report records detailed passes, straightened traces, successful drag-assisted connections, and connections added.
 
-Initial routing now has bounded refinement checkpoints (default every 192 jobs, 0 disables). At each checkpoint, sampled points repel nearby foreign nets and airwires of requests that have already failed, then a legal or lower-conflict reroute is attempted for a few affected routes. The same checkpoint invokes a separate rip-up/reroute method only for conflicts involving accepted early moves, before routing more jobs. That reusable method also applies a bounded force-guided fallback when an ordinary rip-up reroute stalls; it keeps the fallback only if its local blocker/length score improves. This lets early decisions respond to congestion without disturbing unrelated routes.
+Initial routing always blocks foreign-net crossings, including diagonal crossings and intersections at off-grid terminals. Connections without a legal path are left for later stages. Bounded refinement checkpoints (default every 192 jobs, 0 disables) use repulsion from nearby foreign nets and unrouted airwires to guide legal reroutes. Later rip-up searches use a default present congestion cost of 8, down from 24. Missing-route swap probes use this base cost, and a swap succeeds only when every displaced route can be rebuilt legally.
 
 Multi-round routing varies only the initial job order: each seeded trial adds bounded rank jitter (about 5% of the request count) to the chosen density/length priority. Every trial routes the same JSON independently, including repair and refinement; none reuses copper from another trial. The first trial always keeps the deterministic order, so the selection cannot regress below it by the report score. The app, CLI, and programmatic `RouterConfig` all default to one trial; increase the trial count to compare shuffled orders. `--random-seed` reproduces later permutations. Trial results and the chosen round are included in the output report.
 
@@ -179,11 +179,11 @@ The combined stage includes straightening, local repair, and force refinement;
 the detailed stage includes straightening, A*, and segment dragging. Their
 existing tuning controls remain available.
 
-Final conflict checks always run. Omitting `legalization` also omits final
-crossing removal, so experimental output may retain conflicts; the report and
-CLI exit status reflect them. An empty selection creates no generated routes;
-it does not resume a previous run. The existing `strict_final=False` Python
-option still bypasses all post-repair stages.
+Final conflict checks always run. When resuming a board with pre-existing
+conflicts, omitting `legalization` skips final crossing removal. The report
+and CLI exit status reflect any remaining conflicts. An empty selection creates
+no generated routes. The `strict_final=False` Python option bypasses all
+post-repair stages.
 
 `autoroute_report.config.enabled_stages` records the selection. `stage_results`
 records each executed stage's `elapsed_seconds`, `before`/`after` connection
