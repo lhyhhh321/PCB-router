@@ -1,25 +1,68 @@
-# PCB two-stage router design
+# PCB routing pipeline design
 
-## Scope
+The single-signal-layer router previously ran ordered placement, early
+refinement, congestion repair, legalization, missing-route swaps, and board
+compaction as global routing. Its detailed routing loop straightened traces,
+searched for missing connections with hard-obstacle A*, and dragged blockers
+when A* found no path. The detour guard ran on both sides of that loop, followed
+by geometric crossing cleanup.
 
-The router in `pcb_viewer/router.py` is a single-signal-layer PCB router inspired by TritonRoute's architecture. Its ordered placement, congestion repair, legalization, and force refinement form the global stage; a bend/segment drag loop follows as the detailed stage. It is not a source port: TritonRoute targets LEF/DEF IC routing grids and a foundry rule deck, while this application has JSON PCB geometry and a compact clearance rule.
+## Pipeline 1
 
-The corresponding TritonRoute/OpenROAD stages are documented in the official [OpenROAD detailed-routing documentation](https://github.com/The-OpenROAD-Project/OpenROAD/blob/master/src/drt/README.md): pin access analysis, track assignment, initial detailed routing, search and repair, and DRC. The PCB router maps those ideas as follows.
+The pipeline executes the original operations in this order. Obstacle
+construction, pin and grid access, shared pattern and A* search, and final
+read-only conflict checks are available to every pipeline.
 
-| Routing stage | PCB implementation |
-| --- | --- |
-| Pin access | Preserve exact endpoints, snap the search to a configurable grid, and permit only the exact access cell to escape imperfect stacked source data. |
-| Route guides | Use only an explicitly authored `routing_connections[].guide`. Archived deleted-wire interiors are ignored and cannot leak a reference solution into routing. |
-| Track assignment | Try a legal octilinear guide/pattern route before invoking maze search. |
-| Global initial route | Route the densest pin neighborhoods first (or choose faster short-route-first ordering), using 8-neighbor A*. |
-| Randomized order trials | Run the baseline priority order and independently rerun with seeded, bounded rank jitter. Select the cleanest and most complete result, then shorter copper. |
-| Early refinement checkpoints | After each configured batch of initial jobs, try legal force-guided reroutes before placing more jobs. |
-| DRC model | Inflate traces by half-width plus clearance; block foreign-net pads, vias, traces, pours, and wire keepouts. Same-net copper remains accessible. |
-| Search and repair | Identify foreign-net trace-spacing conflicts, rip up implicated routes, and reroute with increasing present and historical congestion costs. Retain the best iteration. |
-| Final legalization | Keep a conflict-free subset, retry removed connections with hard avoidance, try small route swaps, and reject any remaining geometric intersections. An optional reverse-direction pin escape can be enabled programmatically. |
-| Combined straighten/repair/refinement | In each iteration, first replace local zigzags with fewer-bend octilinear patterns; retry missing connections and shorten severe detours by legal local swaps; then sample interior route points, apply balanced attraction/repulsion and spring-gradient steps, and use displaced points as soft A* guides. Retain the best legal completion/length state. |
-| Detailed bend/segment routing | Compress every existing connection into bending points and straight segments. Iteratively straighten them, try hard-obstacle A* for missing lines, and drag actual blocking traces when a simple route cannot be found. |
-| Detour guard | After local repair, leave an extreme stretch explicitly unrouted instead of committing many times the direct distance; configurable or disabled. |
+| Order | Block | Implementation |
+| --- | --- | --- |
+| 1 | Place connections (`initial`) | Try safe patterns and 8-neighbor A* in the configured job order. Resumed jobs are skipped. |
+| 2 | Refine placement (`early_refinement`) | When adjacent to placement, invoke force-guided reroutes between initial batches. Else refine the current routes once. |
+| 3 | Repair congestion (`repair`) | Rip up conflicted routes and reroute with present and historical congestion costs. Keep every rebuilt path free of crossings. |
+| 4 | Legalize routes (`legalization`) | Remove conflicts and retry removed jobs with hard avoidance. |
+| 5 | Swap routes to make room (`missing_route_swaps`) | Probe for missing paths and rebuild a bounded set of displaced routes. |
+| 6 | Compact board traces (`combined`) | Apply the board-wide geometric force model to eligible traces and retain accepted moves. |
+| 7 | Reject excessive detours (`detour_guard`) | Reopen overlong connections so the following blocks can attempt them. |
+| 8 | Straighten traces (`detailed_straighten`) | Simplify legal bend spans while keeping terminals fixed. |
+| 9 | Connect with A* (`detailed_astar`) | Try hard-obstacle A* for each missing connection. |
+| 10 | Drag blocking segments (`detailed_drag`) | When A* finds no path, try sliding nearby interior segments to open a route. |
+| 11 | Reject excessive detours (`detour_guard`) | Remove excessive stretches remaining after trace repair. |
+| 12 | Remove crossings (`crossing_cleanup`) | Remove crossing generated routes, choosing the most conflicted route first. |
+
+Blocks 8–10 are consecutive, so they repeat in that order until a pass makes
+no changes or reaches the configured pass limit. An intervening non-repair
+block starts a separate loop for any following trace-repair blocks.
+Consecutive A* and drag blocks run in order per missing connection. Stop
+when a path is accepted or when an A* candidate is rejected by the board-wide
+legality check. Trials each execute the same pipeline with an independent
+routing state.
+
+## Place & rip-up
+
+The optional `place_ripup` block uses the configured placement order. It first
+attempts to repair existing raster conflicts or geometric crossings in resumed or
+previously generated routes. For each remaining connection, it chooses the next
+action from the result of the search:
+
+1. Place a path found with hard clearance and crossing checks.
+2. If strict placement fails, run a congestion-weighted probe. Move on if the
+   probe finds no route. Place a returned path directly if it has no blockers.
+3. If the probe finds movable blockers, lift those traces before inserting the
+   path. Reroute the lifted connections with increasing congestion costs. Before
+   each further pass, focus on routes changed by the attempt. Keep the result
+   only if all connections are preserved and all changed routes are clear of
+   blockers. A failed or cancelled attempt restores the previous routes.
+
+Both **Place & rip-up** and **Repair congestion** use the trace-intersection and
+diagonal checks from **Place connections**. These checks apply to every reroute,
+including fallback searches that price clearance congestion. Existing generated
+crossings are lifted before repair, and routes that cannot be rebuilt without
+crossing copper stay unrouted. The placement probe runs off the board, so its
+intersections never appear in the routed state or the live preview.
+
+The congestion repair limit allows up to `iterations - 1` passes for existing
+conflicts and up to that many passes per blocked connection. A following
+**Refine placement** block still runs at placement checkpoints. Pipeline 1
+uses its original separate placement and repair blocks.
 
 ## Input contract
 
@@ -40,7 +83,7 @@ Preferred inputs provide an explicit connection list:
 }
 ```
 
-`guide` is optional. The supplied `03第三层右侧删去线网（布线输入）.json` uses `deleted_connections.wires`; only the first/last point, width, net, and layer are extracted. Interior points are discarded. The router never reads `02第三层右侧并删去地线参考.json`.
+`guide` is optional. For older inputs with `deleted_connections.wires`, the router extracts the first/last point, width, net, and layer. Interior points are discarded. The router never reads `02第三层右侧并删去地线参考.json`.
 
 Geometry is read from `pads`, `pins`, `vias`, `wires`, `copper_polygons`, and `keepouts`. Clearance defaults to `metadata.design_rules.clearance_mil`. Missing via/pad shapes use the same fallback radii as the viewer.
 
@@ -61,28 +104,31 @@ Initial patterns and maze searches treat fixed geometry and existing foreign-net
 
 Output polylines retain exact source/target coordinates, collapse collinear grid points, and are tagged with `route_type: "autoroute"` and `autoroute_job`. When two same-net requests share a grid edge, that copper is emitted once. Output may therefore contain several fragments for one request, or no new fragment when its entire path is already conductive. `autoroute_jobs` on a shared fragment records all covered request IDs; `report.routed` counts connected requests rather than wire records.
 
-## Global-stage early and iterative force refinement
+## Placement refinement and board compaction
 
-During initial placement, `early_refine_interval` (default 192 attempted jobs, 0 disables) triggers checkpoints before all jobs have been attempted. Each checkpoint samples existing routes, prioritizes those near airwires of missing requests or conflicts in resumed copper, and tries a small number of legal force-guided maze reroutes. It accepts a move that lowers repulsion or length within its stretch bounds, or reduces conflicts in resumed copper. The report records checkpoint and accepted-move counts. Early and ordinary rip-up guides use repulsion. Attraction is applied in the later combined iterations, where a legal-state rollback is available.
+The checkpoint interval defaults to 192 attempted jobs. Checkpoints sample
+existing traces, prioritize those near airwires or conflicts, and try a bounded
+number of legal force-guided reroutes. Accepted changes reduce repulsion,
+length, or conflict count within the checkpoint's stretch bounds. A zero
+interval disables the in-placement checkpoints.
 
-After initial maze-routing, congestion repair, and legalization, the combined loop runs up to six iterations by default. **Each iteration has three phases:** first straighten legal zigzags; next retry missing requests and try bounded local swaps that shorten already-connected detours; then perform force/gradient refinement. The detour phase probes a shorter low-congestion path, identifies its actual blockers, temporarily removes at most four of them, and commits the swap only when all displaced routes can be rebuilt legally and total emitted copper length decreases. Straightening examines a bounded number of the bendiest routes and replaces local subpaths with one-bend octilinear patterns. It keeps endpoints fixed, rejects foreign-net clearance or crossing violations, requires fewer bends without increasing path or emitted board length, and rolls back any invalid change. The refinement phase samples at most 20 points along each routed connection, never moving the exact two terminals. For a sampled point `p`, nearby foreign-net route cells repel it inside the preferred separation and weakly attract it in a finite band outside that separation. Attraction is counted once per foreign net, not once per connection; missing connections' straight airwires only repel, preserving corridor room. A weak spring term pulls toward the midpoint of adjacent samples. In conceptual form, the update is a clipped gradient step on
+Board compaction in `pcb_viewer/compaction.py` uses a geometric force field.
+Foreign nets repel nearby copper and weakly attract it within a finite band.
+It considers generated routes and eligible unlocked wires on the active layer.
+Pads, pins, vias, and pours contribute to the field while staying anchored.
+The block projects forces onto the normal of each trace and accumulates
+sub-grid displacement across iterations. It preserves terminals and same-net
+junctions. A pass is accepted when energy decreases without increasing raster
+conflicts or adding geometric crossings. Cancelled compaction restores the
+block's starting routes. The default limit is six iterations.
 
-```text
-E = sum(weight * max(0, desired_separation - distance)^2
-        / (2 * desired_separation))
-    - sum(attraction_strength * band / 3 * smoothstep(1 - u))
-    + 0.075 / grid_step * sum(|sample - neighbor_midpoint|^2)
-```
+The detour guard removes a trace when its grid path exceeds the configured
+ratio of terminal-to-terminal distance and adds more than 200 source units.
+The default ratio is three. A zero ratio disables the guard.
 
-Here `u = clamp((distance - desired_separation) / band, 0, 1)`, `band = max(2 * grid_step, desired_separation / 2)`, and `smoothstep(1 - u) = 1 - 3u² + 2u³`. Thus the attraction potential is lowest at the preferred separation, levels off at the outer edge of the band, and contributes no force at or inside the preferred separation. Its maximum force magnitude is half `attraction_strength`; the default strength is 1.0, and 0 disables it. Where a missing connection's airwire exerts repulsion, attraction is suppressed so it cannot immediately close the corridor being reserved. Named fixed copper—including wires, pads, pins, vias, and pours—also supplies attraction on the active layer, even when its net has no routing request. Fixed copper remains a hard A* constraint. Keepouts and unnamed geometry do not attract. Static raster cells represent copper surfaces, so their preferred distance adds only the moving route’s half-width, clearance, and spacing margin; dynamic route centerlines include both half-widths. Fixed and generated geometry of the same foreign net share one attraction contribution, chosen by the smallest distance beyond its preferred spacing.
+## Trace-repair blocks
 
-The step is capped at two routing-grid spacings; virtual airwires receive double weight to reserve room for unfinished requests. The most affected routed jobs (default at most 12) are searched again with their displaced samples as **soft A* guides**. When attraction is active, up to one third of that candidate budget is reserved for spacing-dominated routes so missing-airwire pressure cannot starve the new method. The raw displaced polyline is never committed directly: hard-avoidance A* must find a legal grid path with fixed endpoints. Missing jobs whose airwires exerted force are then retried. An iteration with crossings or clearance conflicts is rolled back. Gradient moves without an immediate connection gain may be retained provisionally only if combined spacing energy decreases and trace length stays within a 3% cap. Across all iterations, the router saves the legal state with the most completed connections, breaking ties by shorter copper length; a shortening repair can therefore be kept even if no extra request connects. `RouterConfig.force_iterations` (default 6, 0 disables; CLI alias `--combined-iterations`) and `force_max_jobs` (default 12) bound the work.
-
-After global repair, `max_detour_ratio` defaults to 3. A trace is handed to detailed routing as unrouted when its grid path exceeds three times the direct terminal distance **and** adds more than 200 source units. Set the ratio to 0 to allow arbitrarily long legal traces. This exposes single-layer/topological cases instead of silently drawing very long copper, but may reduce the completed-request count. None of these heuristics replaces final CAD DRC.
-
-## Detailed bend/segment stage
-
-After the global stage, `DetailedTrace` represents each connected request as its first terminal, direction-change cells, and last terminal, with straight segments between consecutive bends. The underlying grid path remains the authoritative occupancy and emitted copper; the bend/segment model is a movable control representation. The detailed stage repeats two operations in order:
+`DetailedTrace` represents each connected request as its first terminal, direction-change cells, and last terminal, with straight segments between consecutive bends. The underlying grid path remains the authoritative occupancy and emitted copper; the bend/segment model is a movable control representation. Pipeline 1 runs these operations in each repair pass:
 
 1. Straighten routed traces. A bend-span is replaced by a shorter one-bend octilinear pattern only if the path has fewer bends, does not grow, and remains clear of fixed geometry, foreign nets, and centerline crossings. Terminals stay pinned.
 2. For each missing connection, try hard-obstacle A* with zero historical congestion cost, first near its terminal corridor and then over the full board. If no legal path exists, a soft A* probe supplies a candidate corridor. Rank *both* actual blockers and traces within eight grid spacings plus width/clearance of that corridor. Up to 16 nearby internal bend segments (at most two per net) are considered. A move translates exactly one segment parallel by one to four grid cells in either direction. The two new bend cells are exact integer intersections with the original neighboring segment lines; those neighbors may shorten or lengthen but cannot rotate, while every other segment and both terminals stay untouched. Fractional-grid intersections, reversals, self-overlap, detours, fixed obstacles, foreign-net clearance violations, and diagonal crossings are rejected. A bounded best-first search ranks states by how many nets still block the probe corridor, can combine moves on up to three distinct traces, and tries hard A* for the missing connection after each state. It evaluates at most `detailed_drag_states` states (default 12; zero disables dragging). The completed board receives final clearance and crossing checks; unsuccessful searches restore the original routes exactly. This is a constrained geometric drag, not a whole-net rip-up/rebuild.
@@ -140,42 +186,29 @@ See [benchmarks/README.md](benchmarks/README.md) for profiling evidence and
 reproduction. Accelerating independent randomized trials with processes is
 possible future work, but is separate from this tensor backend.
 
-## Selectable pipeline and stage measurements
+## Pipeline configuration and measurements
 
-`RouterConfig.stages` is an optional allowlist of stage identifiers from
-`ROUTING_STAGES`. `None` retains the complete default pipeline; an empty tuple
-runs no placement or optimization. The GUI and `--stages` CLI option expose the
-same allowlist. The canonical execution order remains initial routing (with
-optional nested early checkpoints), congestion repair, legalization and shove,
-combined refinement, detour filtering, detailed routing, and detour filtering
-again. The selectable IDs and usage examples are in README's “Select routing
-stages for experiments” section. Randomized order trials remain controlled by
-`random_rounds`; each trial uses the same stage selection on a fresh router.
+`RoutingPipeline` stores a name and an ordered tuple of block IDs, including
+repeats. An exported file contains `version`, `name`, and `blocks`.
+`RouterConfig.pipeline` accepts a pipeline directly. When omitted, the router
+uses Pipeline 1. Legacy `RouterConfig.stages` and `--stages` options filter
+Pipeline 1 in its original order. Filtering out initial placement also skips
+its nested checkpoints. Iteration limits and `strict_final` retain their
+previous behavior.
 
-Stages may be omitted independently. Early refinement only executes inside
-initial placement. Detailed routing can start with no generated connections.
-Combined/detailed routines retain their existing legal-state rollback behavior;
-if earlier stages leave conflicts, these routines may make no progress.
-Existing interval, iteration, and `strict_final` controls still apply. Shared
-primitives (obstacle construction, pin access, patterns, A*, DRC) stay available
-to every selected stage that uses them. A disabled top-level repair stage does
-not disable local repair inside a selected early or combined stage.
+Final read-only clearance and geometric crossing checks run after the last
+block. Geometric crossing pairs contribute to the final conflict count
+alongside raster conflict locations. The **Remove crossings** block modifies
+the route state wherever it is placed.
 
-Final read-only clearance and geometric crossing checks are unconditional.
-Final crossing removal belongs to legalization. Resumed boards can still
-contain pre-existing violations if legalization is omitted. Remaining geometric
-crossing pairs contribute to the final conflict count alongside raster
-conflict locations.
-
-Each executed stage visit adds a `stage_results` record containing before/after
-routed-request count, emitted length, raster conflict count, elapsed time, and
-cancellation status. Detour visits have `before_detailed`/`after_detailed` phases;
-legalization's final crossing cleanup has `final_crossings`. Records are appended
-on stage completion, so nested early checkpoints precede their enclosing initial
-record. Initial timing includes those checkpoints; other stage timings exclude
-their boundary metric collection. Top-level results describe the selected trial,
-while every `round_results` entry retains its own measurements. Connection gains
-for combined/detailed stages exclude removals by the separate detour guard.
+The report identifies the pipeline and block order in `config`. Each executed
+step adds a `stage_results` record with before/after connection count, emitted
+length, raster conflicts, elapsed time, and cancellation status. Adjacent
+legalization and swaps share one record, and a contiguous trace-repair loop
+shares one record. Pipeline 1 reports its detour phases separately. Nested
+early checkpoints appear before their enclosing placement record and their
+time is included in placement. Top-level results describe the selected trial,
+and every `round_results` entry retains its own measurements.
 
 ## Resume saved partial routing
 

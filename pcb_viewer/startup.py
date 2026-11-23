@@ -43,13 +43,17 @@ def main():
     parser.add_argument('--grid', type=float, default=2.0, help='Autorouter grid spacing (default: 2.0)')
     parser.add_argument('--clearance', type=float, help='Override metadata design-rule clearance')
     from .router import ROUTING_STAGES
-    parser.add_argument('--stages', nargs='*', choices=tuple(ROUTING_STAGES),
-                        help='Built-in stages to include, in fixed pipeline order (default: all; '
-                             'an empty list runs validation only)')
+    from .pipelines import RoutingPipeline
+    pipeline_options = parser.add_mutually_exclusive_group()
+    pipeline_options.add_argument('--pipeline', metavar='FILE',
+                                  help='Exported routing pipeline JSON (default: Pipeline 1)')
+    pipeline_options.add_argument('--stages', nargs='*', choices=tuple(ROUTING_STAGES),
+                                  help='Filter Pipeline 1 stages in their original order '
+                                       '(an empty list runs validation only)')
     parser.add_argument('--resume', action='store_true',
                         help='Continue saved built-in autoroutes instead of starting over')
     parser.add_argument('--iterations', type=int, default=6,
-                        help='Initial congestion-repair passes (default: 6)')
+                        help='Congestion repair limit (defaults to 6, set to 1 to skip repair passes)')
     parser.add_argument('--early-refine-interval', type=int, default=192,
                         help='Try legal reroutes after each N initial jobs (0 disables; default: 192)')
     parser.add_argument('--force-iterations', '--combined-iterations',
@@ -80,8 +84,9 @@ def main():
     parser.add_argument('--freerouting-timeout', type=float, default=600,
                         help='External router time limit in seconds (default: 600)')
     args = parser.parse_args()
-    if args.stages is not None and (not args.autoroute or args.algorithm != 'builtin'):
-        parser.error('--stages requires --autoroute --algorithm builtin')
+    for option, value in (('--pipeline', args.pipeline), ('--stages', args.stages)):
+        if value is not None and (not args.autoroute or args.algorithm != 'builtin'):
+            parser.error(f'{option} requires --autoroute --algorithm builtin')
     if args.resume and (not args.autoroute or args.algorithm != 'builtin'):
         parser.error('--resume requires --autoroute --algorithm builtin')
     if args.autoroute:
@@ -99,6 +104,7 @@ def main():
                                           if wire.get('route_type') != 'autoroute']
             config = RouterConfig(grid_step=args.grid, clearance=args.clearance, resume=args.resume,
                                   stages=None if args.stages is None else tuple(args.stages),
+                                  pipeline=None if args.pipeline is None else RoutingPipeline.load(args.pipeline),
                                   iterations=args.iterations, ordering=args.ordering,
                                   early_refine_interval=args.early_refine_interval,
                                   force_iterations=args.force_iterations,

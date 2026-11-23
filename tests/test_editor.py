@@ -438,6 +438,126 @@ def test_gui_stage_selection_reaches_router(qt_app, monkeypatch):
     w.close()
 
 
+def test_pipeline_page_saves_reloads_and_runs_dragged_blocks(qt_app, tmp_path, monkeypatch):
+    from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+    from PySide6.QtWidgets import QComboBox, QDialog, QFileDialog, QMessageBox
+    import pcb_viewer.app as studio
+    from pcb_viewer.pipeline_editor import BLOCK_ROLE, PipelineEditor
+    from pcb_viewer.pipelines import PIPELINE_1, RoutingPipeline
+
+    settings_path = str(tmp_path / 'library.ini')
+    def settings():
+        return QSettings(settings_path, QSettings.Format.IniFormat)
+
+    monkeypatch.setattr(studio, 'PipelineEditor', lambda: PipelineEditor(settings=settings()))
+    window = studio.MainWindow()
+    window.show()
+    assert window.pages.currentWidget() == window.view
+    window.pipeline_action.trigger()
+    assert window.pages.currentWidget() == window.pipeline_editor
+    assert not window.tab_strip_action.isVisible()
+    editor = window.pipeline_editor
+    assert editor.block_ids() == PIPELINE_1.blocks
+    editor.new_pipeline()
+    editor.name.setText('Swaps / placement')
+
+    def drop_block(block, pos):
+        item = next(editor.palette.item(row) for row in range(editor.palette.count())
+                    if editor.palette.item(row).data(BLOCK_ROLE) == block)
+        mime = editor.palette.mimeData([item])
+        args = Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+        events = QDragEnterEvent(pos, *args), QDragMoveEvent(pos, *args), QDropEvent(QPointF(pos), *args)
+        for event in events:
+            qt_app.sendEvent(editor.blocks.viewport(), event)
+            assert event.isAccepted()
+
+    qt_app.processEvents()
+    drop_block('place_ripup', editor.blocks.viewport().rect().center())
+    top = editor.blocks.visualItemRect(editor.blocks.item(0)).topLeft()
+    drop_block('missing_route_swaps', top + QPoint(8, 1))
+    assert editor.block_ids() == ('missing_route_swaps', 'place_ripup')
+    editor.blocks.setCurrentRow(0)
+    editor.move_block(1)
+    assert editor.block_ids() == ('place_ripup', 'missing_route_swaps')
+    assert editor.save()
+
+    fresh = PipelineEditor(settings=settings())
+    fresh.saved_list.setCurrentText(editor.name.text())
+    fresh.load_saved()
+    assert fresh.draft() == editor.draft()
+    exported = tmp_path / 'pipeline.json'
+    monkeypatch.setattr(QFileDialog, 'getSaveFileName', lambda *_args: (str(exported), ''))
+    monkeypatch.setattr(QFileDialog, 'getOpenFileName', lambda *_args: (str(exported), ''))
+    fresh.export_pipeline()
+    assert RoutingPipeline.load(exported) == editor.draft()
+    fresh.import_pipeline()
+    assert fresh.block_ids() == editor.block_ids()
+
+    window.pipeline_action.trigger()
+    assert window.pages.currentWidget() == window.view
+    assert window.tab_strip_action.isVisible()
+    window.document.data['routing_connections'] = [
+        {'net': 'A', 'layer': 'TOP', 'width': 1, 'start': [0, 0], 'end': [20, 0]},
+    ]
+    def accept(dialog):
+        dialog.findChild(QComboBox, 'routing_pipeline').setCurrentText(editor.name.text())
+        return 1
+
+    monkeypatch.setattr(QDialog, 'exec', accept)
+    monkeypatch.setattr(QMessageBox, 'information', lambda *_args: None)
+    monkeypatch.setattr(QMessageBox, 'question', lambda *_args: QMessageBox.StandardButton.Discard)
+    window.autoroute()
+    report = window.sessions[0]['benchmarks'][f'Built-in — {editor.name.text()}']
+    assert report.routed == 1
+    assert report.config['pipeline_blocks'] == list(editor.block_ids())
+    window.close()
+
+
+def test_drag_back_to_palette_removes_only_dragged_occurrence(qt_app, tmp_path, monkeypatch):
+    from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+    from PySide6.QtGui import QDrag, QDragEnterEvent, QDragMoveEvent, QDropEvent
+    from PySide6.QtTest import QTest
+    from pcb_viewer.pipeline_editor import BLOCK_ROLE, PipelineEditor
+    from pcb_viewer.pipelines import PIPELINE_1
+
+    settings = QSettings(str(tmp_path / 'library.ini'), QSettings.Format.IniFormat)
+    editor = PipelineEditor(settings=settings)
+    editor.resize(900, 630)
+    editor.show()
+    qt_app.processEvents()
+    blocks = editor.blocks
+    palette = editor.palette
+    available = [palette.item(row).data(BLOCK_ROLE) for row in range(palette.count())]
+    second_guard = PIPELINE_1.blocks.index('detour_guard', PIPELINE_1.blocks.index('detour_guard') + 1)
+
+    def drop_in_palette(drag, actions):
+        pos = palette.viewport().rect().bottomRight() - QPoint(8, 8)
+        for event_type in (QDragEnterEvent, QDragMoveEvent, QDropEvent):
+            class PipelineDragEvent(event_type):
+                def source(self):
+                    return drag.source()
+
+            event = PipelineDragEvent(QPointF(pos) if event_type is QDropEvent else pos,
+                                      actions, drag.mimeData(), Qt.MouseButton.LeftButton,
+                                      Qt.KeyboardModifier.NoModifier)
+            qt_app.sendEvent(palette.viewport(), event)
+            assert event.isAccepted()
+        return Qt.DropAction.MoveAction
+
+    monkeypatch.setattr(QDrag, 'exec', drop_in_palette)
+    blocks.setCurrentRow(second_guard)
+    blocks.startDrag(Qt.DropAction.MoveAction)
+    remaining = PIPELINE_1.blocks[:second_guard] + PIPELINE_1.blocks[second_guard + 1:]
+    assert editor.block_ids() == remaining
+    assert [palette.item(row).data(BLOCK_ROLE) for row in range(palette.count())] == available
+    assert editor.has_changes()
+    blocks.setCurrentRow(0)
+    QTest.keyClick(blocks, Qt.Key.Key_Delete)
+    assert editor.block_ids() == remaining[1:]
+    editor.close()
+
+
 def test_gui_resume_is_one_undoable_edit(qt_app, monkeypatch):
     from PySide6.QtWidgets import QDialog, QMessageBox, QCheckBox, QPushButton
     from pcb_viewer.app import MainWindow, RoutingStagesDialog

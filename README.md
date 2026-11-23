@@ -33,7 +33,7 @@ On Windows, activate with `.venv\Scripts\activate`. `python main.py` is an equiv
 
 ## Auto routing
 
-The app includes a single-layer, octilinear detailed router and an optional [Freerouting](https://github.com/freerouting/freerouting) benchmark. Open a routing input, select its signal layer, and choose **Auto route…** (Ctrl+R). Select the algorithm in the dialog; for Freerouting, provide a downloaded `.jar` (or set `FREEROUTING_JAR`). The built-in router defaults to denser-area-first priority for higher completion; short-route-first is faster. By default the app tries **one** routing order. You can increase the trial count to add reproducible, locally shuffled variants; it keeps the conflict-free result with the most routed connections, breaking ties by shorter copper length. The dialog controls trial count/seed, grid spacing, copper clearance, early refinement checkpoints, initial congestion-repair passes, combined straighten/repair/balance iterations, inter-net attraction strength, maximum route stretch, and the Freerouting time limit. All generated traces are committed as one undoable edit and use `route_type: "autoroute"`. The right sidebar shows board-wide auto-route statistics: fully routed and partially routed nets, routed and unrouted requested connections, connection completion, and generated copper length. A net counts as fully routed only when every requested connection for that net is marked routed; the figures update after routing, edits, undo/redo, and tab switches.
+The app includes a single-layer, octilinear detailed router and an optional [Freerouting](https://github.com/freerouting/freerouting) benchmark. Open a routing input, select its signal layer, and choose **Auto route…** (Ctrl+R). Select the algorithm in the dialog; for Freerouting, provide a downloaded `.jar` (or set `FREEROUTING_JAR`). The built-in router defaults to denser-area-first priority for higher completion; short-route-first is faster. By default the app tries **one** routing order. You can increase the trial count to add reproducible, locally shuffled variants; it keeps the conflict-free result with the most routed connections, breaking ties by shorter copper length. The dialog controls trial count/seed, grid spacing, copper clearance, early refinement checkpoints, initial congestion-repair passes, board force-compaction iterations, inter-net attraction strength, maximum route stretch, and the Freerouting time limit. All generated traces are committed as one undoable edit and use `route_type: "autoroute"`. The right sidebar shows board-wide auto-route statistics: fully routed and partially routed nets, routed and unrouted requested connections, connection completion, and generated copper length. A net counts as fully routed only when every requested connection for that net is marked routed; the figures update after routing, edits, undo/redo, and tab switches.
 
 The dedicated manual-routing mode has been removed. Previously saved manual traces remain visible as board data, but the app no longer creates new ones through click-to-route controls.
 
@@ -59,19 +59,19 @@ python -m pcb_viewer --autoroute \
   --output /tmp/pcb-freerouted.json
 ```
 
-The router reads explicit `routing_connections` records (`start`, `end`, `net`, `width`, and `layer`). For this repository's testcase, it reads only those fields and the two endpoints from `deleted_connections.wires`. Every archived interior point is ignored: file 02 is never loaded, compared, or used as a reference. An explicitly authored `routing_connections[].guide` remains supported for other input formats.
+The router reads explicit `routing_connections` records (`start`, `end`, `net`, `width`, and `layer`). For older boards with `deleted_connections.wires`, it reads the layer, net, width, and two endpoints. A `routing_connections[].guide` can supply an explicit routing guide.
 
 The flow follows TritonRoute's broad architecture: pin/grid access, pattern routing, DRC-aware A* maze search, then iterative rip-up and search-and-repair with present and historical congestion costs. Optional explicit guides can bias the search, but the supplied testcase is routed from endpoints. PCB pads, vias, copper polygons, existing traces, per-net same-copper access, trace widths, design-rule clearance, and `wire_keepout` polygons participate in obstacle checks. `via_keepout` masks do not block a trace on the current layer.
 
-The built-in flow has two stages. The existing ordered placement, congestion repair, legalization, and force iterations are global routing. Afterward, detailed routing models each routed connection as bend points joined by straight segments. In each pass it first removes legal bends, then runs hard-obstacle A* for unfinished connections. If A* cannot connect one, a soft probe ranks both blockers and nearby nonblocking traces. A bounded best-first search tests parallel slides of one interior segment at a time. The adjacent two segments remain on their original lines, all other segments are unchanged, and terminals stay fixed. Multiple nearby nets can be slid in successive search steps. Every trial checks obstacles and clearance; the entire search rolls back unless the unfinished connection routes with no conflicts or crossings. Passes stop at a fixed point or `--detailed-max-passes 32` (0 disables the stage); `--detailed-drag-states 12` bounds the search (0 disables dragging). The report records detailed passes, straightened traces, successful drag-assisted connections, and connections added.
+Pipeline 1 preserves the built-in order from placement through final crossing removal. Its trace-repair blocks repeat straightening, hard-obstacle A*, and segment dragging until a pass makes no changes. When A* fails to find a path, a bounded search can slide interior segments of nearby traces while keeping their terminals fixed. Use `--detailed-max-passes` to cap the passes and `--detailed-drag-states` to bound each drag search. The report records passes, straightened traces, drag-assisted connections, and connections added.
 
-Initial routing always blocks foreign-net crossings, including diagonal crossings and intersections at off-grid terminals. Connections without a legal path are left for later stages. Bounded refinement checkpoints (default every 192 jobs, 0 disables) use repulsion from nearby foreign nets and unrouted airwires to guide legal reroutes. Later rip-up searches use a default present congestion cost of 8, down from 24. Missing-route swap probes use this base cost, and a swap succeeds only when every displaced route can be rebuilt legally.
+**Place connections**, **Repair congestion**, and **Place & rip-up** forbid foreign-net crossings, including diagonal crossings and intersections at off-grid terminals. A connection that cannot be routed without a crossing stays unrouted. Bounded refinement checkpoints (default every 192 jobs, 0 disables) use repulsion from nearby foreign nets and unrouted airwires to guide legal reroutes. Repair uses a default present congestion cost of 8. Missing-route swap probes use this base cost, and a swap succeeds only when every displaced route can be rebuilt legally.
 
 Multi-round routing varies only the initial job order: each seeded trial adds bounded rank jitter (about 5% of the request count) to the chosen density/length priority. Every trial routes the same JSON independently, including repair and refinement; none reuses copper from another trial. The first trial always keeps the deterministic order, so the selection cannot regress below it by the report score. The app, CLI, and programmatic `RouterConfig` all default to one trial; increase the trial count to compare shuffled orders. `--random-seed` reproduces later permutations. Trial results and the chosen round are included in the output report.
 
 Before the straightening-first change, three file-03 trials with seed 0 and 5% jitter routed 201/220, 195/220, and 195/220 requested connections, respectively; the baseline won. That multi-round search took about 753 seconds versus about 205 seconds for one trial. Randomized trials are therefore an experiment, not a guaranteed improvement; set one trial for a faster run. The global-only straightening-first baseline routed 202/220. With the previous whole-net rebuild version of detailed routing, one deterministic trial routed 204/220 with zero reported conflict cells in about 501 seconds. With the new segment-slide search, the same single-trial input and defaults routed 204/220, also with zero conflict cells and 32,723.182 units of generated copper, in 724 seconds. Detailed routing took three passes and straightened 70 traces, but no drag-assisted connection succeeded on this dense fixture. The new drag search therefore did **not** improve completion here and added runtime; `--detailed-drag-states 0` disables it when speed matters. Focused synthetic tests do show one- and two-net drag-assisted completions. Earlier global-only attraction strengths 0, 0.5, and 2 all selected the same 202-connection board.
 
-After initial routing and congestion repair, each combined iteration (1) straightens legal zigzags with short octilinear replacements, (2) retries missing connections and tries local swaps to shorten severe detours, then (3) samples interior route points for force/gradient refinement. Straightening keeps endpoints fixed, checks foreign copper and fixed keepouts, and accepts only fewer bends without added emitted wire length. Nearby foreign-net copper repels points when too close and weakly attracts them when farther than a preferred spacing, producing a bounded spacing equilibrium; virtual straight-line corridors of still-unrouted connections only repel. A weak spring further discourages sharp bends. The moved points are **soft guides**, not copper: legal A* reroutes the selected nets, then retries affected unfinished connections. Each iteration is checked for clearance and geometric crossings, and the best legal completion/length result is retained. Hard-avoidance A* ignores old congestion-history penalties so they cannot force a legal route around a needless loop. Finally, routes longer than the configured stretch ratio *and* more than 200 source units beyond their straight-line distance are left explicitly unrouted; 0 disables this limit. Use `--combined-iterations 0` to disable the combined stage (`--force-iterations` remains an alias); `--force-max-jobs` limits the per-iteration gradient work. `--attraction-strength 0` disables the added attraction for comparison.
+The board force-compaction block applies attraction and repulsion to eligible board traces, including generated traces and unlocked existing wires on the active layer. It preserves terminals and junctions and rolls back passes that fail its energy or legality checks. Use `--combined-iterations 0` to disable it. `--force-iterations` is an alias. A force budget of zero also disables compaction. The detour guard removes routes that exceed both the configured stretch ratio and 200 source units of excess length. Set the ratio to zero to disable the guard.
 
 The built-in router emits shared same-net grid edges only once; one requested connection may therefore produce no new copper when it is already covered by another generated branch. The report counts connected requests, while the wire array counts physical trace fragments. An optional reverse-direction pin escape is available through `RouterConfig.reverse_escape`.
 
@@ -147,56 +147,52 @@ QT_QPA_PLATFORM=offscreen python -m pytest -q
 
 Tests cover all four supplied boards, lossless JSON round trips, mask persistence and metadata preservation, undo/redo (including a complete routing run as one edit), failed saves, invalid polygons, router obstacle behavior, and offscreen GUI rendering.
 
-## Select routing stages for experiments
+## Build and run routing pipelines
 
-In **Auto route → Routing stages…**, check the built-in stages to include in
-this run. All are selected by default. The CLI exposes the same selection:
+Click **Pipelines** in the top toolbar. Use **New** to start with an empty
+sequence or **Duplicate** to start from Pipeline 1 or another loaded pipeline.
+Drag blocks from **Available blocks** into **Execution order**. Drag again to
+reorder them. To remove a block, drag it back to **Available blocks**, click
+**Remove block**, or press Delete while it is selected. Blocks can appear more than once.
+
+Enter a name and click **Save** to add the pipeline to the app's library. Use
+the **Saved pipelines** list and **Load** to reopen it. Pipeline 1 is the
+built-in preset. Save variations under a new name. **Export…** writes a
+portable pipeline JSON file, and **Import…** opens one for editing and saving.
+
+Click **Board**, open **Auto route…**, and choose a pipeline. Each trial
+runs that pipeline on a fresh copy of the routing input. CLI runs default to
+Pipeline 1. To run an exported pipeline, use:
 
 ```bash
-# Initial placement only
-python -m pcb_viewer input.json --autoroute --stages initial --output initial.json
-
-# Global routing without combined refinement or detailed routing
-python -m pcb_viewer input.json --autoroute \
-  --stages initial early_refinement repair legalization detour_guard \
-  --output global.json
-
-# Full default pipeline (omit --stages)
-python -m pcb_viewer input.json --autoroute --output full.json
+python -m pcb_viewer input.json --autoroute --pipeline my-pipeline.json --output routed.json
 ```
 
-Available names are `initial`, `early_refinement`, `repair`, `legalization`,
-`combined`, `detour_guard`, and `detailed`. Selection preserves the pipeline's
-execution order, regardless of argument order. `--stages` with no names selects
-none. In Python, use `RouterConfig(stages=("initial", "repair", "legalization"))`;
-`None` selects all and `()` selects none. Selection applies only to the built-in
-router; randomized trials each use the same selection.
+In Python, pass `RouterConfig(pipeline=RoutingPipeline("Placement only", ("initial",)))`
+with `RoutingPipeline` imported from `pcb_viewer.pipelines`. An empty block list
+only checks the current routing state. The optional `--stages` CLI flag,
+`RouterConfig.stages`, and **Filter Pipeline 1 stages…** still filter the
+original preset in its original order.
 
-Early checkpoints require `initial`. Existing zero-valued iteration/interval
-controls still disable their work. Pin access, obstacles, pattern/A* searches,
-and DRC are underlying mechanisms, not independently selectable pipeline stages.
-The combined stage includes straightening, local repair, and force refinement;
-the detailed stage includes straightening, A*, and segment dragging. Their
-existing tuning controls remain available.
+**Place & rip-up** can replace **Place connections** and **Repair congestion** in a
+custom pipeline. It tries a clear route for each missing connection. If that fails, it
+probes for movable blockers, lifts them before placing the new trace, and attempts to
+reroute them. A failed repair restores the previous traces. The congestion
+repair limit bounds the attempts per blocked connection. A limit of 1 skips
+negotiated repair passes. [Placement and rip-up decisions](ROUTER_DESIGN.md#place--rip-up)
 
-Final conflict checks always run. When resuming a board with pre-existing
-conflicts, omitting `legalization` skips final crossing removal. The report
-and CLI exit status reflect any remaining conflicts. An empty selection creates
-no generated routes. The `strict_final=False` Python option bypasses all
-post-repair stages.
+**Refine placement** runs at checkpoints when it immediately follows
+**Place connections** or **Place & rip-up**. In other positions it refines the current board once.
+Consecutive **Straighten traces**, **Connect with A***, and **Drag blocking
+segments** blocks run as an ordered group until stable or until the detailed
+pass limit. Final clearance and crossing checks run after every pipeline.
+Add **Remove crossings** where you want the pipeline to remove crossing
+generated traces.
 
-`autoroute_report.config.enabled_stages` records the selection. `stage_results`
-records each executed stage's `elapsed_seconds`, `before`/`after` connection
-count (`routed`), emitted copper `wire_length`, raster `conflict_cells`, and
-cancellation status. The GUI shows these results after a run; CLI output also
-saves them in JSON. Each entry in `round_results` has its own stage results;
-the top-level results belong to the selected trial. Unexecuted stages have no
-result entry. Early checkpoints appear individually and their time is included
-in `initial`, so do not sum those timings together. Detour filtering runs before
-and after detailed routing, and legalization has a final crossing-cleanup visit;
-`phase` distinguishes those visits. Metric collection and grid preparation add
-overhead to the total run time. Compare connection count, conflicts, length, and
-elapsed time together, keeping the board, grid, seed, and other settings fixed.
+The CLI's `autoroute_report.config.pipeline_blocks` records the selected
+order. `stage_results` records elapsed time, connection count, emitted length,
+and raster conflicts for each completed step or group. Placement timing
+includes its nested checkpoints. See [Pipeline 1's order and block behavior](ROUTER_DESIGN.md#pipeline-1).
 
 ## Continue a partially routed board
 

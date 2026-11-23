@@ -13,8 +13,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraph
     QGraphicsItem, QDockWidget, QWidget, QVBoxLayout, QLabel, QComboBox, QLineEdit,
     QCheckBox, QPushButton, QPlainTextEdit, QFileDialog, QMessageBox, QDoubleSpinBox,
     QToolBar, QDialog, QDialogButtonBox, QSpinBox, QProgressBar, QTabBar,
-    QSizePolicy, QHBoxLayout, QGroupBox, QFormLayout)
+    QSizePolicy, QHBoxLayout, QGroupBox, QFormLayout, QStackedWidget)
 from .model import Document, COLLECTIONS
+from .pipeline_editor import PipelineEditor
+from .pipelines import PIPELINE_1, ROUTING_BLOCKS
 from .router import ROUTING_STAGES, extract_jobs
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
@@ -217,7 +219,12 @@ class MainWindow(QMainWindow):
         self.current_session = -1
         self.resize(1440, 900)
         self.view = BoardView(self)
-        self.setCentralWidget(self.view)
+        self.pages = QStackedWidget()
+        self.pipeline_editor = PipelineEditor()
+        self.pages.addWidget(self.view)
+        self.pages.addWidget(self.pipeline_editor)
+        self.setCentralWidget(self.pages)
+        self._last_pipeline_name = PIPELINE_1.name
         self._routing_preview_items = {}
         self._routing_preview_airwires = {}
         self._routing_preview_hidden = []
@@ -244,7 +251,10 @@ class MainWindow(QMainWindow):
         self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.tabs.currentChanged.connect(self.switch_tab)
         self.tabs.tabCloseRequested.connect(self.close_tab)
-        tab_toolbar.addWidget(self.tabs)
+        self.tab_strip_action = tab_toolbar.addWidget(self.tabs)
+        self.pipeline_action = tab_toolbar.addAction('Pipelines')
+        self.pipeline_action.setCheckable(True)
+        self.pipeline_action.toggled.connect(self.show_pipeline_page)
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
 
         toolbar = QToolBar('Board tools')
@@ -354,6 +364,19 @@ class MainWindow(QMainWindow):
         self.add_session(self.document)
         if filename:
             self.load(filename)
+
+    def show_pipeline_page(self, shown):
+        self.pipeline_action.setText('Board' if shown else 'Pipelines')
+        self.tab_strip_action.setVisible(not shown)
+        board_widgets = (self.main_toolbar, self.side_dock, self.coords)
+        if shown:
+            self._board_widget_visibility = [not widget.isHidden() for widget in board_widgets]
+            for widget in board_widgets:
+                widget.hide()
+        else:
+            for widget, visible in zip(board_widgets, self._board_widget_visibility):
+                widget.setVisible(visible)
+        self.pages.setCurrentWidget(self.pipeline_editor if shown else self.view)
 
     def layer_changed(self, layer):
         if layer != "All layers":
@@ -551,6 +574,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._routing_in_progress:
             self.statusBar().showMessage('Cancel routing before closing the board.', 5000)
+            event.ignore()
+            return
+        if not self.pipeline_editor.allow_discard():
             event.ignore()
             return
         original = self.current_session
@@ -755,17 +781,36 @@ class MainWindow(QMainWindow):
         algorithm = QComboBox()
         algorithm.addItems(['Built-in (TritonRoute-inspired)', 'Freerouting benchmark'])
         layout.addWidget(algorithm)
-        selected_stages = tuple(ROUTING_STAGES)
-        stage_button = QPushButton('Routing stages: all selected…')
+        pipeline_row = QHBoxLayout()
+        pipeline_label = QLabel('Routing pipeline')
+        pipeline_row.addWidget(pipeline_label)
+        pipeline_choice = QComboBox()
+        pipeline_choice.setObjectName('routing_pipeline')
+        for pipeline in self.pipeline_editor.pipelines():
+            pipeline_choice.addItem(pipeline.name, pipeline)
+        pipeline_choice.setCurrentText(self._last_pipeline_name)
+        pipeline_row.addWidget(pipeline_choice, 1)
+        selected_stages = None
+        stage_button = QPushButton('Filter Pipeline 1 stages…')
         stage_button.setObjectName('routing_stages')
         def choose_stages():
             nonlocal selected_stages
-            selector = RoutingStagesDialog(selected_stages, dialog)
+            selector = RoutingStagesDialog(ROUTING_STAGES if selected_stages is None else selected_stages,
+                                           dialog)
             if selector.exec():
                 selected_stages = selector.selected_stages()
-                stage_button.setText(f'Routing stages: {len(selected_stages)}/{len(ROUTING_STAGES)} selected…')
+                stage_button.setText(f'Filter Pipeline 1 stages ({len(selected_stages)}/{len(ROUTING_STAGES)})…')
         stage_button.clicked.connect(choose_stages)
-        layout.addWidget(stage_button)
+        pipeline_row.addWidget(stage_button)
+        layout.addLayout(pipeline_row)
+        def pipeline_controls():
+            builtin = algorithm.currentIndex() == 0
+            pipeline_label.setEnabled(builtin)
+            pipeline_choice.setEnabled(builtin)
+            stage_button.setEnabled(builtin and pipeline_choice.currentData() == PIPELINE_1)
+        pipeline_choice.currentIndexChanged.connect(pipeline_controls)
+        algorithm.currentIndexChanged.connect(pipeline_controls)
+        pipeline_controls()
         resume = QCheckBox('Continue existing routing')
         resume.setObjectName('resume_routing')
         resume.setChecked(any(wire.get('route_type') == 'autoroute'
@@ -838,7 +883,7 @@ class MainWindow(QMainWindow):
             field.setValue(float(value))
             layout.addWidget(field)
             fields[label] = field
-        layout.addWidget(QLabel('Initial congestion-repair passes'))
+        layout.addWidget(QLabel('Congestion repair limit (1 skips repair passes)'))
         iterations = QSpinBox()
         iterations.setRange(1, 64)
         iterations.setValue(6)
@@ -896,7 +941,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(detour_row)
         algorithm.currentIndexChanged.connect(lambda index: (
             resume.setEnabled(index == 0),
-            stage_button.setEnabled(index == 0),
             compute_backend.setEnabled(index == 0),
             rounds_label.setEnabled(index == 0),
             random_rounds.setEnabled(index == 0),
@@ -919,7 +963,8 @@ class MainWindow(QMainWindow):
         freerouting_minutes.setRange(1, 240)
         freerouting_minutes.setValue(10)
         layout.addWidget(freerouting_minutes)
-        note = QLabel('Only the open JSON board is used. Deleted trace interiors are ignored. Each built-in order trial runs the selected stages, so multiple trials can take several times longer. The Freerouting benchmark runs an external JAR through a temporary single-layer DSN; non-terminal copper is conservatively fixed as obstacles.')
+        note = QLabel('Each built-in order trial runs the selected pipeline on the open board. '
+                      'The Freerouting benchmark runs an external JAR with non-terminal copper fixed as obstacles.')
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -931,7 +976,9 @@ class MainWindow(QMainWindow):
 
         scratch = copy.deepcopy(self.document.data)
         scratch_wire_indices = list(range(len(scratch.get('wires', []))))
-        resume_enabled = resume.isChecked() and algorithm.currentIndex() == 0
+        use_freerouting = algorithm.currentIndex() == 1
+        resume_enabled = resume.isChecked() and not use_freerouting
+        pipeline = pipeline_choice.currentData()
         if not resume_enabled:
             scratch_wire_indices = [i for i, wire in enumerate(scratch.get('wires', []))
                                     if wire.get('route_type') != 'autoroute']
@@ -941,7 +988,10 @@ class MainWindow(QMainWindow):
         benchmark_input = hashlib.sha256(json.dumps(
             scratch, sort_keys=True, ensure_ascii=False,
             separators=(',', ':')).encode('utf-8')).hexdigest()
-        config = RouterConfig(stages=selected_stages, resume=resume_enabled,
+        builtin_pipeline = None if use_freerouting or pipeline == PIPELINE_1 else pipeline
+        legacy_stages = selected_stages if not use_freerouting and pipeline == PIPELINE_1 else None
+        config = RouterConfig(stages=legacy_stages, pipeline=builtin_pipeline,
+                              resume=resume_enabled,
                               grid_step=fields['Grid spacing'].value(),
                               clearance=fields['Clearance'].value(),
                               iterations=iterations.value(),
@@ -957,14 +1007,15 @@ class MainWindow(QMainWindow):
                               ordering='dense_first' if ordering.currentIndex() == 0 else 'short',
                               layer=self.visible_layer.currentText()
                               if self.visible_layer.currentText() != 'All layers' else None)
-        use_freerouting = algorithm.currentIndex() == 1
         if use_freerouting:
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_jar', jar_field.text())
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_java', java_field.text())
+        else:
+            self._last_pipeline_name = pipeline.name
         previous_mode = self.mode.currentText()
         self.mode.setCurrentText('Select')
         action_states = [(action, action.isEnabled())
-                         for action in self.main_toolbar.actions()]
+                         for action in [*self.main_toolbar.actions(), self.pipeline_action]]
         for action, _ in action_states:
             action.setEnabled(False)
         self.mode.setEnabled(False)
@@ -1051,7 +1102,8 @@ class MainWindow(QMainWindow):
         self.document.batch_change(changes)
         self.refresh()
         self.fit()
-        backend = 'Freerouting' if use_freerouting else 'Built-in'
+        backend = ('Freerouting' if use_freerouting else
+                   'Built-in' if pipeline == PIPELINE_1 else f'Built-in — {pipeline.name}')
         session = self.sessions[self.current_session]
         if session.get('benchmark_input') != benchmark_input:
             session['benchmarks'] = {}
@@ -1069,11 +1121,16 @@ class MainWindow(QMainWindow):
                   'Generated traces are one undoable edit. Review and run final fabrication DRC before use.')
         if not use_freerouting:
             detail += f'\nResumed connections: {report.resumed_connections}.'
-            detail += '\nSelected stages: ' + (', '.join(report.config.get('enabled_stages', [])) or 'none')
+            blocks = report.config.get('pipeline_blocks', [])
+            detail += f'\nPipeline: {pipeline.name}.'
+            detail += '\nBlocks: ' + (' → '.join(ROUTING_BLOCKS[block][0] for block in blocks) or 'none')
             if report.stage_results:
-                detail += '\nStage results (selected trial; initial includes checkpoints):'
+                detail += '\nStep results for the selected trial (placement includes checkpoints)'
                 for result in report.stage_results:
-                    detail += (f'\n  {result["stage"]}: {result["elapsed_seconds"]:.3f}s, '
+                    names = result.get('blocks')
+                    label = (' → '.join(ROUTING_BLOCKS[block][0] for block in names)
+                             if names else result['phase'] or result['stage'])
+                    detail += (f'\n  {label} · {result["elapsed_seconds"]:.3f}s, '
                                f'{result["before"]["routed"]} → {result["after"]["routed"]} connected, '
                                f'{result["before"]["wire_length"]:.1f} → '
                                f'{result["after"]["wire_length"]:.1f} length, '
