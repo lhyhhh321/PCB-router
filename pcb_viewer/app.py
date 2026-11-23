@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraph
 from .model import Document, COLLECTIONS
 from .pipeline_editor import PipelineEditor
 from .pipelines import PIPELINE_1, ROUTING_BLOCKS
-from .router import ROUTING_STAGES, extract_jobs
+from .router import ROUTING_STAGES, extract_jobs, routing_layer
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
 
@@ -63,6 +63,9 @@ def auto_route_statistics(data):
     nets = {}
     for job in jobs:
         nets.setdefault(job.net, set()).add(job.id)
+    unsupported = data.get('unsupported_connections', [])
+    for index, connection in enumerate(unsupported, 1):
+        nets.setdefault(connection['net'], set()).add(-index)
     routed = set()
     wire_length = 0.0
     for wire in data.get('wires', []):
@@ -84,7 +87,7 @@ def auto_route_statistics(data):
         'nets_total': len(nets),
         'nets_routed': sum(ids <= routed for ids in nets.values()),
         'nets_partial': sum(bool(ids & routed) and not ids <= routed for ids in nets.values()),
-        'connections_total': len(jobs),
+        'connections_total': len(jobs) + len(unsupported),
         'connections_routed': len(routed),
         'wire_length': wire_length,
     }
@@ -399,9 +402,14 @@ class MainWindow(QMainWindow):
         self.visible_layer.addItems(['All layers']+self.document.layers)
         # A single layer is immediately readable on dense full-board samples.
         self.visible_layer.setCurrentIndex(1)
+        preferred_layer = routing_layer(self.document.data)
+        if preferred_layer:
+            self.visible_layer.setCurrentText(preferred_layer)
         self.visible_layer.blockSignals(False)
         self.active_layer.clear()
         self.active_layer.addItems(self.document.layers)
+        if preferred_layer:
+            self.active_layer.setCurrentText(preferred_layer)
 
     def session_state(self):
         return {
@@ -548,6 +556,9 @@ class MainWindow(QMainWindow):
 
     def save(self, save_as=False):
         filename = self.document.path
+        if filename == self.document.import_path and filename is not None:
+            filename = filename.with_name(filename.stem + '-board.json')
+            save_as = True
         if save_as or filename is None:
             filename,_ = QFileDialog.getSaveFileName(self, 'Save PCB JSON', str(filename or 'board.json'), 'PCB JSON (*.json)')
             if not filename:
@@ -602,13 +613,14 @@ class MainWindow(QMainWindow):
         self.view.setSceneRect(rect.adjusted(-100,-100,100,100))
         self.view.fitInView(rect.adjusted(-20,-20,20,20), Qt.AspectRatioMode.KeepAspectRatio)
 
-    def _begin_routing_preview(self):
+    def _begin_routing_preview(self, layer=None):
         """Hide old generated copper without changing the document or undo stack."""
         self._end_routing_preview()
         self._routing_preview_document = self.document
         old_indices = {index for index, wire in
                        enumerate(self.document.data.get('wires', []))
-                       if wire.get('route_type') == 'autoroute'}
+                       if wire.get('route_type') == 'autoroute' and
+                       (layer is None or wire.get('layer', self.document.data.get('layer')) == layer)}
         for item in self.view.scene().items():
             identity = item.data(0)
             if (isinstance(identity, tuple) and len(identity) == 2 and
@@ -975,18 +987,25 @@ class MainWindow(QMainWindow):
             return
 
         scratch = copy.deepcopy(self.document.data)
-        scratch_wire_indices = list(range(len(scratch.get('wires', []))))
         use_freerouting = algorithm.currentIndex() == 1
         resume_enabled = resume.isChecked() and not use_freerouting
+        preferred_layer = routing_layer(scratch)
+        shown_layer = self.visible_layer.currentText()
+        selected_layer = preferred_layer if shown_layer == 'All layers' else shown_layer
+        replacement_layer = selected_layer if preferred_layer or resume_enabled else None
+        existing = scratch.get('wires', [])
+        generated = [index for index, wire in enumerate(existing)
+                     if wire.get('route_type') == 'autoroute' and
+                     (replacement_layer is None or wire.get('layer', scratch.get('layer')) == replacement_layer)]
+        scratch_wire_indices = list(range(len(existing)))
         pipeline = pipeline_choice.currentData()
         if not resume_enabled:
-            scratch_wire_indices = [i for i, wire in enumerate(scratch.get('wires', []))
-                                    if wire.get('route_type') != 'autoroute']
-            scratch['wires'] = [wire for wire in scratch.get('wires', [])
-                                if wire.get('route_type') != 'autoroute']
+            excluded = set(generated)
+            scratch_wire_indices = [index for index in scratch_wire_indices if index not in excluded]
+            scratch['wires'] = [existing[index] for index in scratch_wire_indices]
         scratch.pop('autoroute_report', None)
         benchmark_input = hashlib.sha256(json.dumps(
-            scratch, sort_keys=True, ensure_ascii=False,
+            [selected_layer, scratch], sort_keys=True, ensure_ascii=False,
             separators=(',', ':')).encode('utf-8')).hexdigest()
         builtin_pipeline = None if use_freerouting or pipeline == PIPELINE_1 else pipeline
         legacy_stages = selected_stages if not use_freerouting and pipeline == PIPELINE_1 else None
@@ -1005,8 +1024,7 @@ class MainWindow(QMainWindow):
                               random_seed=random_seed.value(),
                               compute_backend=compute_backend.currentData(),
                               ordering='dense_first' if ordering.currentIndex() == 0 else 'short',
-                              layer=self.visible_layer.currentText()
-                              if self.visible_layer.currentText() != 'All layers' else None)
+                              layer=selected_layer)
         if use_freerouting:
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_jar', jar_field.text())
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_java', java_field.text())
@@ -1041,7 +1059,7 @@ class MainWindow(QMainWindow):
         preview_count = [None]
         routing_document = self.document
         if not use_freerouting:
-            self._begin_routing_preview()
+            self._begin_routing_preview(replacement_layer)
         def visualize(router, round_number, total_rounds, message):
             if self.document is not routing_document:
                 return
@@ -1091,9 +1109,9 @@ class MainWindow(QMainWindow):
             return
 
         existing = self.document.data.get('wires', [])
-        generated = [index for index, wire in enumerate(existing)
-                     if wire.get('route_type') == 'autoroute' and
-                     (not resume_enabled or wire.get('layer', self.document.data.get('layer')) == report.layer)]
+        if resume_enabled and replacement_layer is None:
+            generated = [index for index in generated
+                         if existing[index].get('layer', self.document.data.get('layer')) == report.layer]
         changes = [('wires', scratch_wire_indices[change['index']], change['wire'])
                    for change in report.wire_updates]
         changes.extend(('wires', index, None) for index in reversed(generated))
@@ -1119,6 +1137,9 @@ class MainWindow(QMainWindow):
                   f'{report.conflict_cells} remaining {conflict_label}; '
                   f'{len(report.failed)} unrouted connections.\n\n'
                   'Generated traces are one undoable edit. Review and run final fabrication DRC before use.')
+        if report.unsupported_connections:
+            detail += (f'\n{len(report.unsupported_connections)} imported connection(s) need '
+                       'a layer change or off-board routing.')
         if not use_freerouting:
             detail += f'\nResumed connections: {report.resumed_connections}.'
             blocks = report.config.get('pipeline_blocks', [])
@@ -1241,6 +1262,8 @@ class MainWindow(QMainWindow):
                     for shape in shapes or [{'shape':'circle','radius': 3 if group == 'vias' else 4}]:
                         if shape['shape'] == 'rect':
                             path.addRect(QRectF(x+shape['x1'], -y-shape['y2'], shape['x2']-shape['x1'],shape['y2']-shape['y1']))
+                        elif shape['shape'] == 'polygon':
+                            path.addPath(path_for([(x + dx, y + dy) for dx, dy in shape['points']], close=True))
                         else:
                             radius = shape.get('radius', 4)
                             path.addEllipse(QPointF(x,-y),radius,radius)
@@ -1278,6 +1301,8 @@ class MainWindow(QMainWindow):
         scene.blockSignals(False)
         self.properties.clear()
         overlay = f'  ·  {unrouted_count} unrouted shown' if self.show_unrouted.isChecked() else ''
+        if data.get('unsupported_connections'):
+            overlay += f'\n{len(data["unsupported_connections"]):,} connections need a layer change or off-board routing'
         self.summary.setText(f'{len(data.get("wires", [])):,} wires  ·  {len(data.get("vias", [])):,} vias\n{len(data.get("keepouts", []))} keepouts  ·  {count:,} visible objects{overlay}')
         stats = auto_route_statistics(data)
         routed_count = stats['connections_routed']

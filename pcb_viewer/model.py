@@ -5,8 +5,16 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from .simple_route_json import import_board, source_board
 
 COLLECTIONS = ('wires', 'vias', 'pins', 'pads', 'copper_polygons', 'keepouts', 'components')
+
+
+def import_simple_route_json(data):
+    if any(key in data for key in COLLECTIONS):
+        return None
+    source = source_board(data)
+    return import_board(source, data) if source is not None else None
 
 
 def validate_record(group, record):
@@ -14,6 +22,10 @@ def validate_record(group, record):
         raise ValueError('Objects must be JSON dictionaries.')
     def number(n):
         return isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n)
+    def valid_points(points, minimum):
+        return (isinstance(points, list) and len(points) >= minimum and
+                all(isinstance(p, (list, tuple)) and len(p) == 2 and all(number(n) for n in p)
+                    for p in points))
     for key in ('layer', 'net', 'ref', 'pin_ref', 'padstack', 'via_type', 'type'):
         if key in record and record[key] is not None and not isinstance(record[key], str):
             raise ValueError(f'{key} must be a string.')
@@ -24,14 +36,17 @@ def validate_record(group, record):
         raise ValueError('rotation must be finite.')
     if group in ('pins', 'pads', 'vias', 'components') and 'shape' in record:
         shape = record['shape']
-        if not isinstance(shape, dict) or shape.get('shape') not in ('circle', 'rect'):
-            raise ValueError('Pad shape must be a circle or rect object.')
+        if not isinstance(shape, dict) or shape.get('shape') not in ('circle', 'rect', 'polygon'):
+            raise ValueError('Pad shape must be a circle, rect, or polygon object.')
         if shape['shape'] == 'circle':
             if not number(shape.get('radius')) or shape['radius'] <= 0:
                 raise ValueError('Pad radius must be positive.')
-        elif (not all(number(shape.get(k)) for k in ('x1', 'y1', 'x2', 'y2')) or
-              shape['x1'] >= shape['x2'] or shape['y1'] >= shape['y2']):
-            raise ValueError('Pad rectangle requires valid bounds.')
+        elif shape['shape'] == 'rect':
+            if (not all(number(shape.get(k)) for k in ('x1', 'y1', 'x2', 'y2')) or
+                    shape['x1'] >= shape['x2'] or shape['y1'] >= shape['y2']):
+                raise ValueError('Pad rectangle requires valid bounds.')
+        elif not valid_points(shape.get('points'), 3):
+            raise ValueError('Pad polygon requires at least three finite [x, y] pairs.')
     key = 'vertices' if group == 'copper_polygons' else 'points'
     if group in ('wires', 'copper_polygons', 'keepouts'):
         points = record.get(key)
@@ -73,9 +88,10 @@ def polygon(points):
 
 
 class Document:
-    def __init__(self, data=None, path=None):
+    def __init__(self, data=None, path=None, *, import_path=None):
         self.data = data if data is not None else {'metadata': {'layers': [{'name':'TOP','type':'signal'}]}, 'keepouts': []}
         self.path = Path(path) if path else None
+        self.import_path = Path(import_path) if import_path else None
         self.history = []
         self.position = 0
         self.saved_position = 0
@@ -86,7 +102,10 @@ class Document:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError('The board must be a JSON object.')
-        if not any(k in data for k in COLLECTIONS):
+        imported = import_simple_route_json(data)
+        if imported is not None:
+            return cls(imported, path, import_path=path)
+        if not any(key in data for key in COLLECTIONS):
             raise ValueError('No PCB geometry collections found.')
         for key in COLLECTIONS:
             if key in data:
@@ -180,6 +199,8 @@ class Document:
 
     def save(self, path=None):
         target = Path(path or self.path)
+        if self.import_path and target.resolve() == self.import_path.resolve():
+            raise ValueError('Save the imported SimpleRouteJson as a new PCB Studio board file.')
         output = copy.deepcopy(self.data)
         if self.history and isinstance(output.get('stats'), dict):
             for group in COLLECTIONS:

@@ -11,12 +11,14 @@ from pathlib import Path
 import platform
 import time
 
+from pcb_viewer.model import import_simple_route_json
 from pcb_viewer.router import Autorouter, RouterConfig
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('board', type=Path)
+    parser.add_argument('--layer', help='Route the specified signal layer')
     parser.add_argument('--backends', nargs='+', default=['python', 'torch-cpu', 'torch-mps'])
     parser.add_argument('--initial-jobs', type=int)
     parser.add_argument('--repeat', type=int, default=1)
@@ -25,7 +27,8 @@ def main():
     args = parser.parse_args()
     if args.repeat < 1 or (args.initial_jobs is not None and args.initial_jobs < 1):
         parser.error('repeat and initial-jobs must be positive')
-    data = json.loads(args.board.read_text())
+    data = json.loads(args.board.read_text(encoding='utf-8-sig'))
+    data = import_simple_route_json(data) or data
     data['wires'] = [wire for wire in data.get('wires', []) if wire.get('route_type') != 'autoroute']
     results = []
     reference = None
@@ -39,7 +42,7 @@ def main():
                 engine.torch.ones(1, device=engine.device).cpu()
     for repeat in range(args.repeat):
         for backend in args.backends:
-            config = RouterConfig(compute_backend=backend)
+            config = RouterConfig(compute_backend=backend, layer=args.layer)
             last_notice = time.monotonic()
             def progress(done, total, message):
                 nonlocal last_notice

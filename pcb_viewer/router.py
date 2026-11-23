@@ -217,19 +217,34 @@ class RouteReport:
     stage_results: list[dict] = field(default_factory=list)
     wire_updates: list[dict] = field(default_factory=list)
     compaction_results: list[dict] = field(default_factory=list)
+    unsupported_connections: list[dict] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
-        return not self.failed and not self.conflict_cells and not self.cancelled
+        return not (self.failed or self.conflict_cells or self.cancelled or self.unsupported_connections)
 
     def to_dict(self) -> dict:
         result = asdict(self)
+        if not self.unsupported_connections:
+            result.pop('unsupported_connections')
         result["clean"] = self.clean
         return result
 
 
 def _number(value, fallback: float) -> float:
     return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else fallback
+
+
+def routing_layer(data: dict, requested: str | None = None) -> str | None:
+    """Honor an explicit layer first, then the preferred layer of an SRJ import."""
+    return requested or data.get('metadata', {}).get('simple_route_json_layer')
+
+
+def no_routing_requests(data: dict, layer: str | None = None) -> ValueError:
+    if routing_layer(data) is not None:
+        return ValueError(f'No same-layer SimpleRouteJson routing requests on layer {layer}. '
+                          'Choose a layer with requests. Layer changes and off-board routing are unsupported.')
+    return ValueError('No routing requests found. Expected routing_connections or deleted_connections.wires.')
 
 
 def extract_jobs(data: dict, layer: str | None = None) -> list[RoutingJob]:
@@ -367,16 +382,20 @@ class Autorouter:
             from .torch_costs import TorchCosts
             self.torch_costs = TorchCosts(self.config.compute_backend.removeprefix("torch-"))
         self.order_seed = order_seed
-        self.jobs = extract_jobs(data, self.config.layer)
+        selected_layer = routing_layer(data, self.config.layer)
+        self.jobs = extract_jobs(data, selected_layer)
         if not self.jobs:
-            raise ValueError("No routing requests found. Expected routing_connections or deleted_connections.wires.")
+            raise no_routing_requests(data, selected_layer)
         layers = {job.layer for job in self.jobs}
         if len(layers) != 1:
             raise ValueError("This router currently accepts one signal layer per run.")
         self.layer = next(iter(layers))
-        rules = data.get("metadata", {}).get("design_rules", {})
+        metadata = data.get("metadata", {})
+        rules = metadata.get("design_rules", {})
         self.clearance = (self.config.clearance if self.config.clearance is not None
                           else _number(rules.get("clearance_mil"), 2.0))
+        self.bounds = metadata.get("routing_bounds")
+        self.edge_clearance = _number(rules.get("board_edge_clearance_mil"), 0.0)
         self.step = self.config.grid_step
         self.resume_wires = [wire for wire in data.get("wires", [])
                              if wire.get("route_type") == "autoroute"
@@ -486,6 +505,12 @@ class Autorouter:
             self._commit(job, cells)
 
     def _build_region(self) -> None:
+        if self.bounds is not None:
+            xmin, xmax, ymin, ymax = self.bounds
+            self.origin_x, self.origin_y = xmin, ymin
+            self.cols = math.floor((xmax - xmin) / self.step + 1e-9) + 1
+            self.rows = math.floor((ymax - ymin) / self.step + 1e-9) + 1
+            return
         routing_points = [point for job in self.jobs for point in (job.start, job.goal)]
         if self.config.use_routing_guides:
             routing_points.extend(point for job in self.jobs for point in job.guide)
@@ -517,8 +542,11 @@ class Autorouter:
         return self.origin_x + cell[0] * self.step, self.origin_y + cell[1] * self.step
 
     def _cell(self, point: Point) -> Cell:
-        return (int(round((point[0] - self.origin_x) / self.step)),
-                int(round((point[1] - self.origin_y) / self.step)))
+        x = round((point[0] - self.origin_x) / self.step)
+        y = round((point[1] - self.origin_y) / self.step)
+        if self.bounds is not None:
+            return max(0, min(x, self.cols - 1)), max(0, min(y, self.rows - 1))
+        return x, y
 
     def _add_static(self, cell: Cell, owner: str | None) -> None:
         if self._inside(cell):
@@ -608,6 +636,8 @@ class Autorouter:
                 if isinstance(shape, dict) and shape.get("shape") == "rect":
                     self._mark_rect(x + shape["x1"], y + shape["y1"],
                                     x + shape["x2"], y + shape["y2"], owner)
+                elif isinstance(shape, dict) and shape.get("shape") == "polygon":
+                    self._mark_polygon(((x + dx, y + dy) for dx, dy in shape['points']), owner)
                 else:
                     fallback = 3.0 if group == "vias" else 4.0
                     radius = _number(shape.get("radius"), fallback) if isinstance(shape, dict) else fallback
@@ -644,11 +674,18 @@ class Autorouter:
     def _static_legal(self, cell: Cell, job: RoutingJob, endpoint: bool = False) -> bool:
         if not self._inside(cell):
             return False
+        if self.bounds is not None and not endpoint:
+            xmin, xmax, ymin, ymax = self.bounds
+            x, y = self._point(cell)
+            if min(x - xmin, xmax - x, y - ymin, ymax - y) < job.width / 2 + self.edge_clearance:
+                return False
         radius = job.width / 2 + self.clearance
         for dx, dy in self._offsets(radius):
             nearby = (cell[0] + dx, cell[1] + dy)
             if not self._inside(nearby):
-                return False
+                if self.bounds is None:
+                    return False
+                continue
             owners = self.static.get(self._key(nearby))
             if owners and (None in owners or any(owner != job.net for owner in owners)):
                 # The exact access cell may sit inside imperfect/stacked source
@@ -2148,7 +2185,8 @@ class Autorouter:
         pipeline = self.config.routing_pipeline()
         custom_pipeline = self.config.pipeline is not None and pipeline != PIPELINE_1
         report = RouteReport(self.layer, len(self.jobs),
-                             config={"backend": "builtin", **asdict(self.config)})
+                             config={"backend": "builtin", **asdict(self.config)},
+                             unsupported_connections=self.data.get('unsupported_connections', []))
         report.config.pop("pipeline")
         report.resumed_connections = self.resumed_connections
         report.config["compute_device"] = self.torch_costs.device if self.torch_costs else "python"
@@ -2352,7 +2390,7 @@ def autoroute_data(data: dict, config: RouterConfig | None = None,
         if best_score is None or score > best_score:
             best, best_score = (wires, report), score
             selected_round = round_index + 1
-        if report.clean:
+        if not report.failed and not report.conflict_cells:
             break
     assert best is not None
     wires, report = best

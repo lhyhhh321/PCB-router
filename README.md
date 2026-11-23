@@ -83,6 +83,37 @@ The command writes an `autoroute_report` into the output. The built-in router's 
 
 This is currently a single-layer research router: it does not insert vias, tune differential pairs, enforce length/impedance constraints, or replace a PCB manufacturer's final DRC. See [ROUTER_DESIGN.md](ROUTER_DESIGN.md) for the data contract, cost model, implementation stages, and limitations.
 
+### SimpleRouteJson input
+
+Open a tscircuit SimpleRouteJson file directly in the viewer or pass it to
+`--autoroute`. PCB Studio converts millimeters to mils for its geometry and
+routing settings. It imports the rectangular bounds, pads and obstacles,
+trace widths, and existing wire and via copper. Multi-terminal nets are split
+into a minimum spanning tree that prefers pairs sharing a routing layer.
+
+```bash
+python -m pcb_viewer pcb_example/simple_route_json/circuit001.simple-route.json \
+  --autoroute --output /tmp/circuit001-routed.json
+```
+
+Choose a layer in the viewer or pass `--layer bottom` to the CLI. By default
+an import uses the first layer with routable pairs, with `top` preferred.
+Each run routes one layer and preserves generated traces on other layers.
+Pairs that need a new layer transition or off-board routing appear under
+`unsupported_connections` in the output report. A CLI run that writes output
+with unsupported pairs exits with status 2. Advanced SimpleRouteJson constraints
+such as nonrectangular outlines, bus length matching, and differential pairs are retained
+in the source data for reference. Routing uses the rectangular `bounds`.
+
+The first save in the viewer asks for a new PCB Studio JSON file. CLI output
+uses the same format, with the original input embedded in `simple_route_json_source`.
+
+[`pcb_example/simple_route_json/`](pcb_example/simple_route_json) contains all
+85 input JSONs from the default `dataset01` benchmark, copied byte for byte
+with their [MIT license](pcb_example/simple_route_json/LICENSE). Sources are
+the [tscircuit benchmark runner](https://github.com/tscircuit/tscircuit-autorouter/blob/ed52af82d5a58845bd199f14777475e7c0e054ed/scripts/run-sample.ts)
+and its [pinned dataset](https://github.com/tscircuit/autorouting-dataset-01/tree/b97f5052a2359ab2da3f186765c6a5e839535efb/lib/dataset).
+
 ## Optional PyTorch acceleration
 
 Install `python -m pip install -r requirements-torch.txt`, then select a

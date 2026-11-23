@@ -18,7 +18,7 @@ import tempfile
 import time
 import zipfile
 
-from .router import Autorouter, RouteReport, RouterConfig, extract_jobs
+from .router import Autorouter, RouteReport, RouterConfig, extract_jobs, no_routing_requests, routing_layer
 
 
 def required_java_version(jar_path: str | Path) -> int:
@@ -110,9 +110,10 @@ def _xy(points) -> str:
 
 def export_dsn(data: dict, config: RouterConfig) -> str:
     """Make a one-signal-layer DSN with real obstacles and requested pins."""
-    jobs = extract_jobs(data, config.layer)
+    selected_layer = routing_layer(data, config.layer)
+    jobs = extract_jobs(data, selected_layer)
     if not jobs:
-        raise ValueError('No routing requests found.')
+        raise no_routing_requests(data, selected_layer)
     layers = {job.layer for job in jobs}
     if len(layers) != 1:
         raise ValueError('Freerouting benchmark accepts one signal layer per run.')
@@ -129,23 +130,25 @@ def export_dsn(data: dict, config: RouterConfig) -> str:
     terminal_shapes = {}
     for group in ('vias', 'pads', 'pins'):
         for obj in data.get(group, []):
-            if 'x' not in obj or 'y' not in obj:
+            if ('x' not in obj or 'y' not in obj or obj.get('layer', layer) not in (None, layer)
+                    or (obj.get('layers') and layer not in obj['layers'])):
                 continue
             key = obj.get('net'), (float(obj['x']), float(obj['y']))
             if key in terminals:
                 terminal_shapes[key] = obj.get('shape') or {
                     'shape': 'circle', 'radius': 3 if group == 'vias' else 4}
-    all_points = [point for _, point in terminals]
-    for group in ('vias', 'pads', 'pins'):
-        all_points += [(obj['x'], obj['y']) for obj in data.get(group, [])
-                       if 'x' in obj and 'y' in obj]
-    for group, key in (('copper_polygons', 'vertices'), ('keepouts', 'points'), ('wires', 'points')):
-        all_points += [tuple(p) for obj in data.get(group, []) for p in obj.get(key, [])]
-    margin = max(20, config.boundary_margin)
-    xmin = min(x for x, _ in all_points) - margin
-    xmax = max(x for x, _ in all_points) + margin
-    ymin = min(y for _, y in all_points) - margin
-    ymax = max(y for _, y in all_points) + margin
+    bounds = data.get('metadata', {}).get('routing_bounds')
+    if bounds is None:
+        all_points = [point for _, point in terminals]
+        for group in ('vias', 'pads', 'pins'):
+            all_points += [(obj['x'], obj['y']) for obj in data.get(group, [])
+                           if 'x' in obj and 'y' in obj]
+        for group, key in (('copper_polygons', 'vertices'), ('keepouts', 'points'), ('wires', 'points')):
+            all_points += [tuple(p) for obj in data.get(group, []) for p in obj.get(key, [])]
+        margin = max(20, config.boundary_margin)
+        bounds = [min(x for x, _ in all_points) - margin, max(x for x, _ in all_points) + margin,
+                  min(y for _, y in all_points) - margin, max(y for _, y in all_points) + margin]
+    xmin, xmax, ymin, ymax = bounds
     qlayer = _atom(layer)
     lines = [f'(PCB "pcb_view_benchmark"',
              ' (parser (string_quote ") (space_in_quoted_tokens on))',
@@ -175,6 +178,9 @@ def export_dsn(data: dict, config: RouterConfig) -> str:
                 x1, y1 = x + shape['x1'], y + shape['y1']
                 x2, y2 = x + shape['x2'], y + shape['y2']
                 geometry = f'(rect {qlayer} {_num(x1)} {_num(y1)} {_num(x2)} {_num(y2)})'
+            elif shape.get('shape') == 'polygon':
+                coordinates = _xy((x + dx, y + dy) for dx, dy in shape['points'])
+                geometry = f'(polygon {qlayer} 0 {coordinates})'
             else:
                 radius = float(shape.get('radius', 3 if group == 'vias' else 4))
                 geometry = f'(circ {qlayer} {_num(radius * 2)} {_num(x)} {_num(y)})'
@@ -208,6 +214,8 @@ def export_dsn(data: dict, config: RouterConfig) -> str:
             x1, y1, x2, y2 = (shape[field] for field in ('x1', 'y1', 'x2', 'y2'))
             coordinates = _xy(((x1, y1), (x2, y1), (x2, y2), (x1, y2)))
             geometry = f'(polygon {qlayer} 0.01 {coordinates})'
+        elif shape.get('shape') == 'polygon':
+            geometry = f'(polygon {qlayer} 0.01 {_xy(shape["points"])})'
         else:
             geometry = f'(circle {qlayer} {_num(max(1, shape.get("radius", 1)) * 2)} 0 0)'
         lines.append(f'  (padstack PAD_{name} (shape {geometry}))')
@@ -345,6 +353,8 @@ def _connected_jobs(jobs, wires, data=None):
             if shape.get('shape') == 'rect':
                 radius = max(math.hypot(shape[x], shape[y])
                              for x in ('x1', 'x2') for y in ('y1', 'y2'))
+            elif shape.get('shape') == 'polygon':
+                radius = max(math.hypot(x, y) for x, y in shape['points'])
             else:
                 radius = shape.get('radius', 3 if group == 'vias' else 4)
             access_radius[(obj['net'], (float(obj['x']), float(obj['y'])))] = float(radius)
@@ -410,15 +420,17 @@ def freeroute_data(data: dict, config: RouterConfig, jar_path: str,
     if timeout_seconds <= 0:
         raise ValueError('Freerouting time limit must be positive.')
     java, java_version = resolve_java(jar, java_executable)
-    jobs = extract_jobs(data, config.layer)
+    selected_layer = routing_layer(data, config.layer)
+    jobs = extract_jobs(data, selected_layer)
     if not jobs:
-        raise ValueError('No routing requests found.')
+        raise no_routing_requests(data, selected_layer)
     started = time.monotonic()
     layer = jobs[0].layer
     report = RouteReport(layer, len(jobs), config={'backend': 'freerouting',
                          'jar': str(jar), 'timeout_seconds': timeout_seconds,
                          **asdict(config), 'java_executable': java,
-                         'java_version': java_version})
+                         'java_version': java_version},
+                         unsupported_connections=data.get('unsupported_connections', []))
     with tempfile.TemporaryDirectory(prefix='pcb-freerouting-') as directory:
         source = Path(directory) / 'input.dsn'
         output = Path(directory) / 'routed.ses'
