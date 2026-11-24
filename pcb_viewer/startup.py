@@ -68,6 +68,8 @@ def main():
                         help='Bounded segment-slide search states per missed connection (0 disables; default: 12)')
     parser.add_argument('--attraction-strength', type=float, default=RouterConfig().attraction_strength,
                         help='Board-wide inter-net spacing attraction (0 disables it, default %(default)s)')
+    parser.add_argument('--repulsion-strength', type=float, default=RouterConfig().repulsion_strength,
+                        help='Strength for the Repulsion pipeline block (0 disables it, default %(default)s)')
     parser.add_argument('--max-detour-ratio', type=float, default=3.0,
                         help='Reject extreme route stretch after repair (0 disables; default: 3)')
     parser.add_argument('--ordering', choices=tuple(ROUTING_ORDERS), default='dense_first',
@@ -115,6 +117,7 @@ def main():
                                   detailed_max_passes=args.detailed_max_passes,
                                   detailed_drag_states=args.detailed_drag_states,
                                   attraction_strength=args.attraction_strength,
+                                  repulsion_strength=args.repulsion_strength,
                                   max_detour_ratio=args.max_detour_ratio,
                                   random_rounds=args.random_rounds,
                                   random_seed=args.random_seed,

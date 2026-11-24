@@ -131,6 +131,30 @@ The detour guard removes a trace when its grid path exceeds the configured
 ratio of terminal-to-terminal distance and adds more than 200 source units.
 The default ratio is three. A zero ratio disables the guard.
 
+## Repulsion
+
+The **Repulsion** block spreads generated and resumed traces on the active
+layer. Each pass computes forces from a snapshot of the whole board. Traces
+and copper pours repel turns and intermediate control points, with force
+fading to zero 24 grid steps beyond clearance. Pins, pads, and vias constrain
+clearance. Short spans also get a movable interior control when space permits.
+Displacement acts across the trace and is limited to one grid step per pass.
+
+Terminals and shared junctions stay fixed. For each contact with same-net
+terminal or pour copper, the router retains a verified contact point or
+preserves the original span for grazing contacts. Moved controls are rejoined by
+continuous grid spans, and the entire set of proposed moves is checked for
+clearance, crossings, and board boundaries before it is accepted. When a span
+would collide, its controls stay in place and the other spans are checked again
+as a group. An imported trace whose off-grid geometry cannot be preserved by a
+grid move stays fixed.
+Cancellation restores the routes from before the block.
+
+The block runs up to fourteen passes and can finish with a batch of legal
+outward steps for traces that stayed in place. Its **Repulsion strength**
+setting defaults to 1 and accepts 0 to 4. Use 0 to disable it. The CLI
+equivalent is `--repulsion-strength`.
+
 ## Trace-repair blocks
 
 `DetailedTrace` represents each connected request as its first terminal, direction-change cells, and last terminal, with straight segments between consecutive bends. The underlying grid path remains the authoritative occupancy and emitted copper; the bend/segment model is a movable control representation. Pipeline 1 runs these operations in each repair pass:

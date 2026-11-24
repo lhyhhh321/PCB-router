@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "name": "Pipeline 5",
+  "blocks": [
+    "place_ripup",
+    "detailed_straighten",
+    "legalization",
+    "repulsion",
+    "clear_congestion",
+    "place_ripup",
+    "legalization",
+    "detailed_straighten",
+    "missing_route_swaps",
+    "repulsion",
+    "clear_congestion",
+    "place_ripup",
+    "legalization",
+    "missing_route_swaps",
+    "combined",
+    "detour_guard",
+    "detailed_straighten",
+    "crossing_cleanup"
+  ]
+}

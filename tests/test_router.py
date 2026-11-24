@@ -282,6 +282,16 @@ def test_geometric_crossing_guard_detects_off_grid_segments():
     assert Autorouter._geometric_crossings(wires) == {(0, 1)}
 
 
+def test_geometric_crossing_guard_handles_axis_aligned_bounds():
+    wires = [
+        {'net': 'A', 'autoroute_job': 0, 'points': [[5, -5], [5, 5]]},
+        {'net': 'B', 'autoroute_job': 1, 'points': [[10, 0], [0, 0]]},
+        {'net': 'C', 'autoroute_job': 2, 'points': [[5, 2], [7, 2]]},
+        {'net': 'D', 'autoroute_job': 3, 'points': [[5, 5], [5, 8]]},
+    ]
+    assert Autorouter._geometric_crossings(wires) == {(0, 1)}
+
+
 def test_shared_same_net_corridor_is_emitted_only_once():
     board = {'layer': 'TOP', 'routing_connections': [
         {'net': 'N', 'layer': 'TOP', 'width': 2, 'start': [0, 0], 'end': [10, 0]},

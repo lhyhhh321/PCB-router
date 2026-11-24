@@ -28,6 +28,8 @@ Use **Pipelines** in the top toolbar to create or duplicate a pipeline. Drag blo
 
 Choose a saved pipeline in **Auto route…** or pass its file to the CLI. The default is Pipeline 1. Add `--resume` to continue saved routing.
 
+Add **Repulsion** after a placement block to spread existing routed traces while preserving their connections. Adjust **Repulsion strength** in **Auto route…** or use `--repulsion-strength`.
+
 ```bash
 python -m pcb_viewer input.json --autoroute \
   --pipeline pipelines/pipeline-3.json --output routed.json

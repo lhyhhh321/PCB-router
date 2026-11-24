@@ -38,11 +38,13 @@ class BoardForceField:
                     for other_net, sx, sy, shalf in self.buckets.get((bx, by), ()):
                         if other_net == net:
                             continue
-                        surface = math.hypot(sx-x, sy-y)-shalf
-                        if other_net not in nearest or surface < nearest[other_net][0]:
-                            nearest[other_net] = (surface, sx, sy, shalf)
-            for _, sx, sy, shalf in nearest.values():
-                distance = math.hypot(sx-x, sy-y)
+                        dx, dy = sx - x, sy - y
+                        distance = math.hypot(dx, dy)
+                        surface = distance - shalf
+                        previous = nearest.get(other_net)
+                        if previous is None or surface < previous[0]:
+                            nearest[other_net] = (surface, distance, dx, dy, shalf)
+            for _, distance, dx, dy, shalf in nearest.values():
                 target = half + shalf + self.clearance + self.step
                 gap = distance - target
                 if gap >= self.reach:
@@ -54,8 +56,8 @@ class BoardForceField:
                     magnitude = self.strength * gap / self.reach
                     energy += self.strength * (gap * gap / self.reach - self.reach) / 2
                 if distance > 1e-9:
-                    fx += magnitude * (sx-x) / distance
-                    fy += magnitude * (sy-y) / distance
+                    fx += magnitude * dx / distance
+                    fy += magnitude * dy / distance
             result.append((fx, fy, energy))
         return result
 
@@ -128,8 +130,9 @@ def compact(router, progress=None):
         promoted[next_id] = index
         next_id += 1
     router.max_half_width = max(job.width / 2 for job in router.jobs_by_id.values())
+    promoted_indices = set(promoted.values())
     router.data = {**original_data, 'wires': [w for i, w in enumerate(original_wires)
-                                           if i not in set(promoted.values())]}
+                                           if i not in promoted_indices]}
     router.static.clear()
     router._rasterize_board()
     starting = {i: list(path) for i, path in router.routes.items()}
@@ -137,6 +140,15 @@ def compact(router, progress=None):
     rounds = 0
     cancelled = False
     router.compaction_results = []
+
+    # Pads, vias and pours stay anchored across all compaction rounds.
+    tiles = {}
+    for key, nets in router.static.items():
+        cell = router._cell_from_key(key)
+        for net in nets:
+            if net:
+                tiles.setdefault((net, cell[0]//4, cell[1]//4), cell)
+    fixed_samples = [(net, (*router._point(cell), 0.0)) for (net, _, _), cell in tiles.items()]
 
     def field_state():
         sources = {}
@@ -149,15 +161,8 @@ def compact(router, progress=None):
             indices = sorted(set([0, *range(1, len(path)-1, max(1, math.ceil(len(path)/32))), len(path)-1]))
             spans[job_id] = (len(queries), indices)
             queries.extend((*router._point(path[i]), job.width/2, job.net) for i in indices)
-        # Pads/vias/pours stay anchored, but their nets also contribute copper.
-        tiles = {}
-        for key, nets in router.static.items():
-            cell = router._cell_from_key(key)
-            for net in nets:
-                if net:
-                    tiles.setdefault((net, cell[0]//4, cell[1]//4), cell)
-        for (net, _, _), cell in tiles.items():
-            sources.setdefault(net, []).append((*router._point(cell), 0.0))
+        for net, sample in fixed_samples:
+            sources.setdefault(net, []).append(sample)
         field = BoardForceField(sources, router.clearance, router.step,
                                 router.config.attraction_strength, router.torch_costs)
         values = field.evaluate(queries)
@@ -249,7 +254,7 @@ def compact(router, progress=None):
                 router._commit(job, candidate if legal else old_path)
                 if legal:
                     changed.add(i)
-            _, _, new_energy = field_state()
+            new_energy = field_state()[2] if changed else old_energy
             accepted = (bool(changed) and new_energy < old_energy - 1e-6 and
                         len(router._conflicts()[0]) <= before_conflicts and
                         router._geometric_crossings(all_wires()) <= before_crossings)

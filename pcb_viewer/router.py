@@ -6,9 +6,10 @@ model, and iterative rip-up/search-and-repair with historical costs.
 """
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from functools import partial
 import heapq
 import itertools
 import math
@@ -16,13 +17,14 @@ import random
 import time
 from typing import Callable, Iterable, Iterator
 
-from .pipelines import DETAIL_BLOCKS, PIPELINE_1, PLACEMENT_BLOCKS, RoutingPipeline
+from .pipelines import DETAIL_BLOCKS, PIPELINE_1, PLACEMENT_BLOCKS, ROUTING_BLOCKS, RoutingPipeline
 
 
 Point = tuple[float, float]
 Cell = tuple[int, int]
 Progress = Callable[[int, int, str], bool | None]
 RoutePreview = Callable[["Autorouter", int, int, str], None]
+_SQRT_2 = math.sqrt(2)
 
 
 # The legacy stage selector filters Pipeline 1 in its original order.
@@ -80,6 +82,7 @@ class RouterConfig:
     resume: bool = False
     pipeline: RoutingPipeline | None = None
     unrouted_pin_cost: float = 4.0
+    repulsion_strength: float = 1.0
 
     def stage_enabled(self, stage: str) -> bool:
         if self.pipeline is not None:
@@ -134,6 +137,8 @@ class RouterConfig:
             raise ValueError("Maximum force-refinement jobs cannot be negative.")
         if not math.isfinite(self.attraction_strength) or not 0 <= self.attraction_strength <= 2:
             raise ValueError("Attraction strength must be between 0 and 2.")
+        if not math.isfinite(self.repulsion_strength) or not 0 <= self.repulsion_strength <= 4:
+            raise ValueError("Repulsion strength must be between 0 and 4.")
         if not math.isfinite(self.max_detour_ratio) or self.max_detour_ratio < 0:
             raise ValueError("Maximum detour ratio cannot be negative.")
         if not 0 <= self.detailed_max_passes <= 64:
@@ -225,6 +230,8 @@ class RouteReport:
     wire_updates: list[dict] = field(default_factory=list)
     compaction_results: list[dict] = field(default_factory=list)
     unsupported_connections: list[dict] = field(default_factory=list)
+    repulsion_passes: int = 0
+    repulsion_traces_moved: int = 0
 
     @property
     def clean(self) -> bool:
@@ -323,6 +330,9 @@ class _TraceIndex:
         size = self.bucket_size
         ax, ay = math.floor(a[0] / size), math.floor(a[1] / size)
         bx, by = math.floor(b[0] / size), math.floor(b[1] / size)
+        if ax == bx and ay == by:
+            yield ax, ay
+            return
         for y in range(min(ay, by), max(ay, by) + 1):
             for x in range(min(ax, bx), max(ax, bx) + 1):
                 yield x, y
@@ -333,14 +343,19 @@ class _TraceIndex:
         for a, b in itertools.pairwise(points):
             # Walk long segments in bucket-sized steps to avoid indexing the
             # entire bounding rectangle of a long diagonal fixed wire.
-            parts = max(1, math.ceil(max(abs(a[0] - b[0]), abs(a[1] - b[1])) /
-                                     self.bucket_size))
+            parts = math.ceil(max(abs(a[0] - b[0]), abs(a[1] - b[1])) / self.bucket_size)
+            segment = a, b
+            if parts <= 1:
+                for key in self._keys(a, b):
+                    self.buckets.setdefault(key, {}).setdefault(owner, set()).add(segment)
+                    footprint.add(key)
+                continue
             previous = a
             for i in range(1, parts + 1):
                 end = b if i == parts else (a[0] + (b[0] - a[0]) * i / parts,
                                             a[1] + (b[1] - a[1]) * i / parts)
                 for key in self._keys(previous, end):
-                    self.buckets.setdefault(key, {}).setdefault(owner, set()).add((a, b))
+                    self.buckets.setdefault(key, {}).setdefault(owner, set()).add(segment)
                     footprint.add(key)
                 previous = end
 
@@ -365,12 +380,17 @@ class _TraceIndex:
         s3, s4 = side(c, d, a), side(c, d, b)
         return (s1 <= 0 <= s2 or s2 <= 0 <= s1) and (s3 <= 0 <= s4 or s4 <= 0 <= s3)
 
-    def intersections(self, a: Point, b: Point, net: str) -> Iterator[tuple[str | None, int | None]]:
+    def intersections(self, a: Point, b: Point, net: str, *, same_net: bool = False,
+                      exclude_job: int | None = None) -> Iterator[tuple[str | None, int | None]]:
         if self.buckets:
             for key in self._keys(a, b):
                 for owner, segments in self.buckets.get(key, {}).items():
-                    if owner[0] != net and any(self._intersects(a, b, c, d) for c, d in segments):
-                        yield owner
+                    if (owner[0] == net) != same_net or (exclude_job is not None and owner[1] == exclude_job):
+                        continue
+                    for c, d in segments:
+                        if self._intersects(a, b, c, d):
+                            yield owner
+                            break
 
 
 class Autorouter:
@@ -435,6 +455,8 @@ class Autorouter:
             for job in self.jobs if self.config.use_routing_guides and len(job.guide) >= 2
         }
         self._offset_cache: dict[tuple[int, int], tuple[Cell, ...]] = {}
+        self._offsets_by_radius: dict[float, tuple[Cell, ...]] = {}
+        self._offset_rows: dict[float, list[tuple[int, int, int]]] = {}
         self._rasterize_board()
         self.resume_paths: dict[int, list[Cell]] = {}
         self.resume_points: dict[int, list[Point]] = {}
@@ -566,19 +588,19 @@ class Autorouter:
         last = min(limit - 1, int(math.ceil((high - origin) / self.step)))
         return range(first, last + 1)
 
-    def _mark_disk(self, x: float, y: float, radius: float, owner: str | None) -> None:
+    def _disk_cells(self, x: float, y: float, radius: float) -> Iterator[Cell]:
         pad = self.step * 0.55
         for j in self._indices(y - radius - pad, y + radius + pad, self.origin_y, self.rows):
             py = self.origin_y + j * self.step
             for i in self._indices(x - radius - pad, x + radius + pad, self.origin_x, self.cols):
                 px = self.origin_x + i * self.step
                 if (px - x) ** 2 + (py - y) ** 2 <= (radius + pad) ** 2:
-                    self._add_static((i, j), owner)
+                    yield i, j
 
-    def _mark_rect(self, x1: float, y1: float, x2: float, y2: float, owner: str | None) -> None:
+    def _rect_cells(self, x1: float, y1: float, x2: float, y2: float) -> Iterator[Cell]:
         for j in self._indices(min(y1, y2), max(y1, y2), self.origin_y, self.rows):
             for i in self._indices(min(x1, x2), max(x1, x2), self.origin_x, self.cols):
-                self._add_static((i, j), owner)
+                yield i, j
 
     @staticmethod
     def _distance_to_segment(px: float, py: float, a: Point, b: Point) -> float:
@@ -589,7 +611,7 @@ class Autorouter:
         t = max(0.0, min(1.0, ((px - a[0]) * dx + (py - a[1]) * dy) / length2))
         return math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy))
 
-    def _mark_segment(self, a: Point, b: Point, radius: float, owner: str | None) -> None:
+    def _segment_cells(self, a: Point, b: Point, radius: float) -> Iterator[Cell]:
         pad = radius + self.step * 0.55
         for j in self._indices(min(a[1], b[1]) - pad, max(a[1], b[1]) + pad,
                                self.origin_y, self.rows):
@@ -598,9 +620,9 @@ class Autorouter:
                                    self.origin_x, self.cols):
                 px = self.origin_x + i * self.step
                 if self._distance_to_segment(px, py, a, b) <= pad:
-                    self._add_static((i, j), owner)
+                    yield i, j
 
-    def _mark_polygon(self, points: Iterable[Iterable[float]], owner: str | None) -> None:
+    def _polygon_cells(self, points: Iterable[Iterable[float]]) -> Iterator[Cell]:
         pts = [(float(p[0]), float(p[1])) for p in points]
         if len(pts) < 3:
             return
@@ -620,9 +642,34 @@ class Autorouter:
                 for i in self._indices(left, right, self.origin_x, self.cols):
                     x = self.origin_x + i * self.step
                     if left - self.step * 0.1 <= x <= right + self.step * 0.1:
-                        self._add_static((i, j), owner)
+                        yield i, j
         for a, b in edges:
-            self._mark_segment(a, b, 0.0, owner)
+            yield from self._segment_cells(a, b, 0.0)
+
+    @staticmethod
+    def _terminal_geometry(obj: dict, group: str) -> tuple | None:
+        x, y = obj.get("x"), obj.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+        shape = obj.get("shape")
+        if isinstance(shape, dict) and shape.get("shape") == "rect":
+            return "rect", (x + shape["x1"], y + shape["y1"], x + shape["x2"], y + shape["y2"])
+        if isinstance(shape, dict) and shape.get("shape") == "polygon":
+            return "polygon", (tuple((x + dx, y + dy) for dx, dy in shape["points"]),)
+        fallback = 3.0 if group == "vias" else 4.0
+        radius = _number(shape.get("radius"), fallback) if isinstance(shape, dict) else fallback
+        return "disk", (float(x), float(y), max(0.0, radius))
+
+    def _shape_cells(self, kind: str, geometry: tuple) -> Iterator[Cell]:
+        if kind == "rect":
+            return self._rect_cells(*geometry)
+        if kind == "polygon":
+            return self._polygon_cells(*geometry)
+        return self._disk_cells(*geometry)
+
+    def _mark_static(self, cells: Iterable[Cell], owner: str | None) -> None:
+        for cell in cells:
+            self._add_static(cell, owner)
 
     def _applies_to_layer(self, obj: dict) -> bool:
         obj_layer = obj.get("layer", self.data.get("layer"))
@@ -637,24 +684,14 @@ class Autorouter:
             for obj in self.data.get(group, []):
                 if not isinstance(obj, dict) or not self._applies_to_layer(obj):
                     continue
-                x, y = obj.get("x"), obj.get("y")
-                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                    continue
                 owner = obj.get("net") if isinstance(obj.get("net"), str) else None
-                shape = obj.get("shape")
-                if isinstance(shape, dict) and shape.get("shape") == "rect":
-                    self._mark_rect(x + shape["x1"], y + shape["y1"],
-                                    x + shape["x2"], y + shape["y2"], owner)
-                elif isinstance(shape, dict) and shape.get("shape") == "polygon":
-                    self._mark_polygon(((x + dx, y + dy) for dx, dy in shape['points']), owner)
-                else:
-                    fallback = 3.0 if group == "vias" else 4.0
-                    radius = _number(shape.get("radius"), fallback) if isinstance(shape, dict) else fallback
-                    self._mark_disk(float(x), float(y), max(0.0, radius), owner)
+                geometry = self._terminal_geometry(obj, group)
+                if geometry is not None:
+                    self._mark_static(self._shape_cells(*geometry), owner)
         for obj in self.data.get("copper_polygons", []):
             if isinstance(obj, dict) and self._applies_to_layer(obj):
                 owner = obj.get("net") if isinstance(obj.get("net"), str) else None
-                self._mark_polygon(obj.get("vertices", []), owner)
+                self._mark_static(self._polygon_cells(obj.get("vertices", [])), owner)
         for obj in self.data.get("wires", []):
             if not isinstance(obj, dict) or not self._applies_to_layer(obj):
                 continue
@@ -663,64 +700,101 @@ class Autorouter:
             points = obj.get("points", [])
             self.fixed_traces.add(owner, None, map(tuple, points))
             for a, b in zip(points, points[1:]):
-                self._mark_segment(tuple(a), tuple(b), radius, owner)
+                self._mark_static(self._segment_cells(tuple(a), tuple(b), radius), owner)
         for obj in self.data.get("keepouts", []):
             if (isinstance(obj, dict) and obj.get("type", "wire_keepout") == "wire_keepout"
                     and self._applies_to_layer(obj)):
-                self._mark_polygon(obj.get("points", []), None)
+                self._mark_static(self._polygon_cells(obj.get("points", [])), None)
 
-    def _offsets(self, radius: float) -> tuple[Cell, ...]:
+    def _offsets(self, radius: float, *, by_radius=None, by_key=None) -> tuple[Cell, ...]:
+        if by_radius is None:
+            by_radius = self._offsets_by_radius
+        offsets = by_radius.get(radius)
+        if offsets is not None:
+            return offsets
+        if by_key is None:
+            by_key = self._offset_cache
         cells = max(0, int(math.ceil(radius / self.step)))
         cache_key = cells, int(round(radius / self.step * 1000))
-        if cache_key not in self._offset_cache:
+        if cache_key not in by_key:
             physical = radius + self.step * 0.35
-            self._offset_cache[cache_key] = tuple(
+            by_key[cache_key] = tuple(
                 (dx, dy) for dy in range(-cells, cells + 1) for dx in range(-cells, cells + 1)
                 if (dx * self.step) ** 2 + (dy * self.step) ** 2 <= physical ** 2
             ) or ((0, 0),)
-        return self._offset_cache[cache_key]
+        offsets = by_key[cache_key]
+        by_radius[radius] = offsets
+        return offsets
 
     def _static_legal(self, cell: Cell, job: RoutingJob, endpoint: bool = False) -> bool:
         if not self._inside(cell):
             return False
-        if self.bounds is not None and not endpoint:
-            xmin, xmax, ymin, ymax = self.bounds
+        bounds = self.bounds
+        if bounds is not None and not endpoint:
+            xmin, xmax, ymin, ymax = bounds
             x, y = self._point(cell)
             if min(x - xmin, xmax - x, y - ymin, ymax - y) < job.width / 2 + self.edge_clearance:
                 return False
+        cx, cy = cell
+        cols, rows = self.cols, self.rows
+        net = job.net
+        static = self.static
         radius = job.width / 2 + self.clearance
-        for dx, dy in self._offsets(radius):
-            nearby = (cell[0] + dx, cell[1] + dy)
-            if not self._inside(nearby):
-                if self.bounds is None:
+        # Preserve stencil initialization even when the endpoint waives copper checks.
+        offsets = self._offsets(radius)
+        if bounds is not None and endpoint:
+            return True
+        for dx, dy in offsets:
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < cols and 0 <= ny < rows):
+                if bounds is None:
                     return False
                 continue
-            owners = self.static.get(self._key(nearby))
-            if owners and (None in owners or any(owner != job.net for owner in owners)):
-                # The exact access cell may sit inside imperfect/stacked source
-                # data.  Only that cell is waived; the escape still must clear.
-                if not endpoint:
-                    return False
+            owners = static.get(ny * cols + nx)
+            # The exact access cell can sit inside stacked source geometry.
+            if not endpoint and owners and (len(owners) != 1 or net is None or net not in owners):
+                return False
         return True
 
     def _dynamic_context(self, cell: Cell, job: RoutingJob) -> tuple[set[int], int]:
         conflicts: set[int] = set()
         historical = 0
-        search_radius = job.width / 2 + self.clearance + self.max_half_width
+        usage, history = self.usage, self.history
+        clearance, half, net = self.clearance, job.width / 2, job.net
+        radius = half + clearance + self.max_half_width
+        offset_rows = self._offset_rows.get(radius)
+        if offset_rows is None:
+            # Each row of the circular stencil is one contiguous run of offsets.
+            offset_rows = []
+            for dy, row in itertools.groupby(self._offsets(radius), lambda offset: offset[1]):
+                offsets = list(row)
+                offset_rows.append((dy, offsets[0][0], offsets[-1][0]))
+            self._offset_rows[radius] = offset_rows
+        if not usage and not history:
+            return conflicts, historical
+        cols, rows = self.cols, self.rows
+        step, origin_x, origin_y = self.step, self.origin_x, self.origin_y
+        cx, cy = cell
+        jobs = self.jobs_by_id
         x, y = self._point(cell)
-        for dx, dy in self._offsets(search_radius):
-            nearby = (cell[0] + dx, cell[1] + dy)
-            if not self._inside(nearby):
+        for dy, left, right in offset_rows:
+            ny = cy + dy
+            if not 0 <= ny < rows:
                 continue
-            key = self._key(nearby)
-            for other_id in self.usage.get(key, ()):
-                other = self.jobs_by_id[other_id]
-                required = job.width / 2 + other.width / 2 + self.clearance
-                ox, oy = self._point(nearby)
-                if (other.net != job.net and
-                        (x - ox) ** 2 + (y - oy) ** 2 < (required - 1e-7) ** 2):
-                    conflicts.add(other_id)
-            historical += self.history.get(key, 0)
+            start, stop = cx + left, cx + right + 1
+            row_key = ny * cols
+            for key in range(row_key + max(0, start), row_key + min(cols, stop)):
+                users = usage.get(key)
+                if users:
+                    ox, oy = origin_x + (key - row_key) * step, origin_y + ny * step
+                    for other_id in users:
+                        other = jobs[other_id]
+                        if other.net != net:
+                            required = half + other.width / 2 + clearance
+                            if (x - ox) ** 2 + (y - oy) ** 2 < (required - 1e-7) ** 2:
+                                conflicts.add(other_id)
+                if history:
+                    historical += history.get(key, 0)
         return conflicts, historical
 
     def _dynamic_cost_parts(self, cell: Cell, job: RoutingJob) -> tuple[int, int]:
@@ -750,12 +824,17 @@ class Autorouter:
         radius = self._pin_cost_radius
         bucket = math.floor(x / radius), math.floor(y / radius)
         nearest_squared = radius * radius
+        routes = self.routes
         for net, (px, py), job_ids in self._routing_pin_buckets.get(bucket, ()):
             if net == job.net:
                 continue
             squared = (x - px) ** 2 + (y - py) ** 2
-            if squared < nearest_squared and not any(job_id in self.routes for job_id in job_ids):
-                nearest_squared = squared
+            if squared < nearest_squared:
+                for job_id in job_ids:
+                    if job_id in routes:
+                        break
+                else:
+                    nearest_squared = squared
         if nearest_squared >= radius * radius:
             return 0.0
         proximity = 1.0 - math.sqrt(nearest_squared) / radius
@@ -799,7 +878,7 @@ class Autorouter:
     @staticmethod
     def _heuristic(a: Cell, b: Cell) -> float:
         dx, dy = abs(a[0] - b[0]), abs(a[1] - b[1])
-        return max(dx, dy) + (math.sqrt(2) - 1) * min(dx, dy)
+        return max(dx, dy) + (_SQRT_2 - 1) * min(dx, dy)
 
     def _astar(self, job: RoutingJob, bounds: tuple[int, int, int, int],
                present_factor: float, hard_avoidance: bool = False,
@@ -840,8 +919,10 @@ class Autorouter:
             # Small searches stay scalar; amortize tensor setup on larger ones.
             if expansions == 256 and self.torch_costs is not None:
                 fields = self.torch_costs.build(self, job, bounds)
+            reverse = (old_direction + 4) % 8 if old_direction >= 0 else -1
+            a = None
             for direction, (dx, dy) in enumerate(self.DIRECTIONS):
-                if old_direction >= 0 and direction == (old_direction + 4) % 8:
+                if direction == reverse:
                     continue
                 nxt = cell[0] + dx, cell[1] + dy
                 if not (x1 <= nxt[0] <= x2 and y1 <= nxt[1] <= y2):
@@ -867,7 +948,7 @@ class Autorouter:
                 conflicts += len(diagonals)
                 if hard_avoidance and conflicts:
                     continue
-                move = math.sqrt(2) if dx and dy else 1.0
+                move = _SQRT_2 if dx and dy else 1.0
                 bend = self.config.bend_penalty if old_direction >= 0 and old_direction != direction else 0.0
                 dynamic = present_factor * conflicts + weight * historical
                 cell_cost = cell_cost_cache.get(nxt)
@@ -876,7 +957,8 @@ class Autorouter:
                     cell_cost_cache[nxt] = cell_cost
                 new_cost = cost + move + bend + dynamic + cell_cost
                 if new_cost + 1e-12 < best.get(nxt, math.inf):
-                    a = job.start if cell == start else self._point(cell)
+                    if a is None:
+                        a = job.start if cell == start else self._point(cell)
                     b = job.goal if nxt == goal else self._point(nxt)
                     if not self._trace_edge_clear(a, b, job, avoid_route_crossings):
                         continue
@@ -1088,28 +1170,35 @@ class Autorouter:
                 any(not self._trace_edge_clear(a, b, job, True)
                     for a, b in itertools.pairwise(self._raw_points(job, path))))
 
-    def _conflict_details(self) -> tuple[set[int], set[tuple[int, int]]]:
+    def _conflict_details(self, offsets_for_radius=None) -> tuple[set[int], set[tuple[int, int]]]:
+        if offsets_for_radius is None:
+            offsets_for_radius = self._offsets
         cells: set[int] = set()
         pairs: set[tuple[int, int]] = set()
-        for key, users in self.usage.items():
-            cell = self._cell_from_key(key)
-            x, y = self._point(cell)
+        usage, jobs = self.usage, self.jobs_by_id
+        cols, rows = self.cols, self.rows
+        clearance = self.clearance
+        step, origin_x, origin_y = self.step, self.origin_x, self.origin_y
+        for key, users in usage.items():
+            cy, cx = divmod(key, cols)
+            x, y = self._point((cx, cy))
             for job_id in users:
-                job = self.jobs_by_id[job_id]
-                radius = job.width / 2 + self.clearance + self.max_half_width
-                for dx, dy in self._offsets(radius):
-                    nearby = cell[0] + dx, cell[1] + dy
-                    if not self._inside(nearby):
+                job = jobs[job_id]
+                half = job.width / 2
+                radius = half + clearance + self.max_half_width
+                for dx, dy in offsets_for_radius(radius):
+                    nx, ny = cx + dx, cy + dy
+                    if not (0 <= nx < cols and 0 <= ny < rows):
                         continue
-                    other_key = self._key(nearby)
-                    for other_id in self.usage.get(other_key, ()):
+                    other_key = ny * cols + nx
+                    for other_id in usage.get(other_key, ()):
                         if job_id == other_id:
                             continue
-                        other = self.jobs_by_id[other_id]
+                        other = jobs[other_id]
                         if other.net == job.net:
                             continue
-                        ox, oy = self._point(nearby)
-                        required = job.width / 2 + other.width / 2 + self.clearance
+                        ox, oy = origin_x + nx * step, origin_y + ny * step
+                        required = half + other.width / 2 + clearance
                         if (x - ox) ** 2 + (y - oy) ** 2 < (required - 1e-7) ** 2:
                             cells.update((key, other_key))
                             pairs.add((min(job_id, other_id), max(job_id, other_id)))
@@ -1120,6 +1209,25 @@ class Autorouter:
                     cells.add(self._key(square))
                     pairs.add((min(first, second), max(first, second)))
         return cells, pairs
+
+    def preview_congestion(self, tile_cells: int) -> tuple[dict[Cell, int], set[Cell], set[Cell]]:
+        """Count routed nets per tile and locate repair history and grid conflicts."""
+        def tile(key: int) -> Cell:
+            x, y = self._cell_from_key(key)
+            return x // tile_cells, y // tile_cells
+
+        nets_by_tile: dict[Cell, set[str]] = {}
+        for key, users in self.usage.items():
+            nets = nets_by_tile.setdefault(tile(key), set())
+            nets.update(self.jobs_by_id[job_id].net for job_id in users)
+        # The shared stencil cache quantizes radii. Preview queries must leave
+        # its initialization order up to the routing stages.
+        offsets = partial(self._offsets, by_radius=self._offsets_by_radius.copy(),
+                          by_key=self._offset_cache.copy())
+        conflicts, _ = self._conflict_details(offsets)
+        return ({cell: len(nets) for cell, nets in nets_by_tile.items()},
+                {tile(key) for key, visits in self.history.items() if visits},
+                {tile(key) for key in conflicts})
 
     def _conflicts(self) -> tuple[set[int], set[int]]:
         cells, pairs = self._conflict_details()
@@ -1389,14 +1497,12 @@ class Autorouter:
         return shortened
 
     def _path_length(self, path: list[Cell]) -> float:
-        return sum(math.dist(self._point(a), self._point(b))
-                   for a, b in zip(path, path[1:]))
+        return sum(math.dist(a, b) for a, b in itertools.pairwise(map(self._point, path)))
 
     @staticmethod
     def _path_bends(path: list[Cell]) -> int:
-        directions = [(b[0] - a[0], b[1] - a[1])
-                      for a, b in zip(path, path[1:])]
-        return sum(a != b for a, b in zip(directions, directions[1:]))
+        directions = ((b[0] - a[0], b[1] - a[1]) for a, b in itertools.pairwise(path))
+        return sum(a != b for a, b in itertools.pairwise(directions))
 
     def _straighten_routes(self, limit: int = 8) -> int:
         """Remove legal local zigzags using shortest one-bend octilinear patterns.
@@ -1417,6 +1523,18 @@ class Autorouter:
             original = self.routes[job_id]
             before_length = self._emitted_length()
             self._remove(job_id)
+            # Candidates see the same occupancy while this route is removed.
+            goal = original[-1]
+            legal_cells: dict[Cell, bool] = {}
+
+            def shortcut_cell_is_legal(cell: Cell) -> bool:
+                legal = legal_cells.get(cell)
+                if legal is None:
+                    legal = (self._static_legal(cell, job, cell == goal)
+                             and not self._dynamic_context(cell, job)[0])
+                    legal_cells[cell] = legal
+                return legal
+
             path = original
             for _ in range(4):
                 turns = DetailedTrace.from_path(job_id, path).bend_indices
@@ -1436,9 +1554,7 @@ class Autorouter:
                         for shortcut in self._pattern_paths(subjob):
                             if shortcut == path[start:end + 1]:
                                 continue
-                            if any(not self._static_legal(cell, job, cell == path[-1]) or
-                                   self._dynamic_context(cell, job)[0]
-                                   for cell in shortcut[1:]):
+                            if not all(shortcut_cell_is_legal(cell) for cell in shortcut[1:]):
                                 continue
                             if any(self._diagonal_blockers(a, b, job)
                                    for a, b in zip(shortcut, shortcut[1:])):
@@ -1452,6 +1568,9 @@ class Autorouter:
                                 best_path, best_score = candidate, score
                 if best_path is None:
                     break
+                if best_path[-1] != goal:
+                    goal = best_path[-1]
+                    legal_cells.clear()
                 path = best_path
             self._commit(job, path)
             if (path == original or self._conflicts()[0] or
@@ -1790,7 +1909,8 @@ class Autorouter:
                 continue
             trace = DetailedTrace.from_path(other_id, path)
             for segment in range(1, len(trace.bends) - 2):
-                a, b = (self._point(cell) for cell in trace.segments[segment])
+                a = self._point(trace.bends[segment])
+                b = self._point(trace.bends[segment + 1])
                 distance = min(self._distance_to_segment(x, y, a, b)
                                for x, y in samples)
                 reach = ((target.width + other.width) / 2 + self.clearance +
@@ -1855,13 +1975,17 @@ class Autorouter:
                 if depth >= min(3, self.config.max_shove_blockers):
                     continue
                 generated = 0
+                traces: dict[int, DetailedTrace] = {}
                 for offset in (-1, 1, -2, 2, -3, 3, -4, 4):
                     for other_id, segment in candidates:
                         if other_id in moved:
                             continue
                         other = self.jobs_by_id[other_id]
                         old_path = self.routes[other_id]
-                        trace = DetailedTrace.from_path(other_id, old_path)
+                        trace = traces.get(other_id)
+                        if trace is None:
+                            trace = DetailedTrace.from_path(other_id, old_path)
+                            traces[other_id] = trace
                         if segment >= len(trace.bends) - 2:
                             continue
                         candidate = self._detailed_slide_segment(trace, old_path,
@@ -2059,21 +2183,25 @@ class Autorouter:
         """Find proper centerline crossings, including off-grid end segments."""
         segments = []
         for wire in wires:
-            for a, b in zip(wire['points'], wire['points'][1:]):
-                segments.append((a, b, wire['net'], wire['autoroute_job']))
+            for a, b in itertools.pairwise(wire['points']):
+                segments.append((min(a[0], b[0]), max(a[0], b[0]), min(a[1], b[1]), max(a[1], b[1]),
+                                 a, b, wire['net'], wire['autoroute_job']))
+        # Once the next segment starts beyond the current x range, none of
+        # the remaining segments can meet it in their interiors.
+        segments.sort(key=lambda segment: segment[0])
 
         def side(a: list[float], b: list[float], c: list[float]) -> float:
             return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
         crossings: set[tuple[int, int]] = set()
-        for index, (a, b, net, job_id) in enumerate(segments):
-            for c, d, other_net, other_id in segments[index + 1:]:
+        for index, (left, right, bottom, top, a, b, net, job_id) in enumerate(segments):
+            for other_index in range(index + 1, len(segments)):
+                other_left, other_right, other_bottom, other_top, c, d, other_net, other_id = segments[other_index]
+                if other_left >= right:
+                    break
                 if job_id == other_id or net == other_net:
                     continue
-                if (max(a[0], b[0]) <= min(c[0], d[0]) or
-                        max(c[0], d[0]) <= min(a[0], b[0]) or
-                        max(a[1], b[1]) <= min(c[1], d[1]) or
-                        max(c[1], d[1]) <= min(a[1], b[1])):
+                if other_right <= left or top <= other_bottom or other_top <= bottom:
                     continue
                 if (side(a, b, c) * side(a, b, d) < -1e-9 and
                         side(c, d, a) * side(c, d, b) < -1e-9):
@@ -2241,8 +2369,7 @@ class Autorouter:
         removed = set()
         crossings = self._geometric_crossings(self._unique_wire_runs())
         while crossings:
-            severity = {job_id: sum(job_id in pair for pair in crossings)
-                        for pair in crossings for job_id in pair}
+            severity = Counter(job_id for pair in crossings for job_id in pair)
             rejected_id = max(severity, key=lambda job_id: (severity[job_id],
                                -math.dist(self.jobs_by_id[job_id].start,
                                          self.jobs_by_id[job_id].goal), job_id))
@@ -2269,7 +2396,11 @@ class Autorouter:
             if not custom_pipeline else list(pipeline.blocks)
         )
 
+        last_done = 0
+
         def update(done: int, message: str) -> bool:
+            nonlocal last_done
+            last_done = done
             if preview is not None:
                 preview(self, done, len(self.jobs), message)
             if progress is None:
@@ -2318,7 +2449,8 @@ class Autorouter:
         cancelled_during_placement_or_repair = False
         placement_and_repair = (*PLACEMENT_BLOCKS, "early_refinement", "repair")
         for stage, blocks in pipeline.steps():
-            if not self.config.strict_final and stage not in placement_and_repair:
+            if not self.config.strict_final and stage not in (
+                    *placement_and_repair, "clear_congestion", "repulsion"):
                 continue
             if stage in PLACEMENT_BLOCKS:
                 checkpoint = refine_checkpoint if len(blocks) > 1 else None
@@ -2337,6 +2469,10 @@ class Autorouter:
             elif stage == "repair":
                 with measure(stage):
                     self._repair_congestion(report, lambda done, _total, message: update(done, message))
+            elif stage == "clear_congestion":
+                with measure(stage):
+                    self.history.clear()
+                    report.cancelled = not update(last_done, ROUTING_BLOCKS[stage][0])
             elif stage in ("legalization", "missing_route_swaps"):
                 with measure(stage, blocks):
                     if stage == "legalization":
@@ -2351,6 +2487,13 @@ class Autorouter:
                     report.force_iterations_run += iterations
                     report.force_jobs_moved += moved
                     report.force_new_connections += failed_before - len(failed)
+            elif stage == "repulsion" and self.config.repulsion_strength:
+                from .repulsion import repel_routes
+
+                with measure(stage):
+                    passes, moved, report.cancelled = repel_routes(self, late_progress)
+                    report.repulsion_passes += passes
+                    report.repulsion_traces_moved += moved
             elif stage == "detour_guard" and self.config.max_detour_ratio:
                 phase = None
                 if not custom_pipeline:

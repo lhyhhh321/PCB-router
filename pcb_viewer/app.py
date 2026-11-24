@@ -20,6 +20,12 @@ from .pipelines import PIPELINE_1, ROUTING_BLOCKS
 from .router import ROUTING_ORDERS, ROUTING_STAGES, extract_jobs, routing_layer
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
+CONGESTION_COLORS = (
+    ('One net', '#6abaff', 100),
+    ('Multiple nets', '#ffe077', 150),
+    ('Repair history', '#ff993f', 185),
+    ('Grid conflict', '#ff4860', 220),
+)
 
 
 class RoutingStagesDialog(QDialog):
@@ -235,10 +241,22 @@ class MainWindow(QMainWindow):
         self._routing_preview_document = None
         self._routing_preview_labels = None
         self._routing_preview_last_paint = 0.0
+        self._routing_congestion_items = []
+        self._routing_congestion_last_paint = None
+        self._routing_congestion_snapshot = None
         self._routing_in_progress = False
         self._route_progress_label = None
         self._route_progress_bar = None
         self._route_cancel_button = None
+        swatches = [f'<span style="color:{color}">■</span> {label}'
+                    for label, color, _ in CONGESTION_COLORS]
+        self.congestion_legend = QLabel(' &nbsp; '.join(swatches[:2]) + '<br>' +
+                                       ' &nbsp; '.join(swatches[2:]))
+        self.congestion_legend.setToolTip(
+            'Tiles distinguish one routed net from several nearby nets. Repair history marks cells '
+            'penalized during repair. Grid conflicts take precedence.')
+        self.statusBar().addWidget(self.congestion_legend)
+        self.congestion_legend.hide()
         self.coords = QLabel('Source coordinates')
         self.statusBar().addPermanentWidget(self.coords)
 
@@ -281,6 +299,12 @@ class MainWindow(QMainWindow):
         action('Redo', 'Ctrl+Shift+Z', lambda: self.history(True))
         action('Fit board', 'F', self.fit)
         action('Auto route…', 'Ctrl+R', self.autoroute)
+        self.congestion_action = toolbar.addAction('Congestion')
+        self.congestion_action.setCheckable(True)
+        self.congestion_action.setChecked(True)
+        self.congestion_action.setVisible(False)
+        self.congestion_action.setToolTip('Show congestion on the active routing layer')
+        self.congestion_action.toggled.connect(self._show_routing_congestion)
         toolbar.addSeparator()
         self.mode = QComboBox()
         self.mode.addItems(['Select', 'Rectangle', 'Polygon'])
@@ -618,6 +642,8 @@ class MainWindow(QMainWindow):
         """Hide old generated copper without changing the document or undo stack."""
         self._end_routing_preview()
         self._routing_preview_document = self.document
+        self.congestion_action.setVisible(True)
+        self._show_routing_congestion(self.congestion_action.isChecked())
         old_indices = {index for index, wire in
                        enumerate(self.document.data.get('wires', []))
                        if wire.get('route_type') == 'autoroute' and
@@ -636,6 +662,9 @@ class MainWindow(QMainWindow):
 
     def _end_routing_preview(self):
         scene = self.view.scene()
+        self._clear_routing_congestion()
+        self.congestion_action.setVisible(False)
+        self.congestion_legend.hide()
         for _, item, _ in self._routing_preview_items.values():
             if item.scene() is scene:
                 scene.removeItem(item)
@@ -658,6 +687,64 @@ class MainWindow(QMainWindow):
         self._routing_preview_document = None
         self._routing_preview_last_paint = 0.0
 
+    def _show_routing_congestion(self, visible):
+        self.congestion_legend.setVisible(visible and self._routing_preview_document is not None)
+        for item in self._routing_congestion_items:
+            item.setVisible(visible)
+        self._routing_congestion_last_paint = None
+
+    def _clear_routing_congestion(self):
+        for item in self._routing_congestion_items:
+            self.view.scene().removeItem(item)
+        self._routing_congestion_items.clear()
+        self._routing_congestion_last_paint = None
+        self._routing_congestion_snapshot = None
+
+    def _draw_routing_congestion(self, router, now):
+        if not self.congestion_action.isChecked():
+            return
+        if not router.usage and not router.history:
+            self._clear_routing_congestion()
+            return
+        last_paint = self._routing_congestion_last_paint
+        previous = self._routing_congestion_snapshot
+        history_cleared = not router.history and previous is not None and bool(previous[1])
+        if last_paint is not None and now - last_paint < 0.5 and not history_cleared:
+            return
+        snapshot = (router.routes, router.history.keys(), router.max_half_width)
+        if snapshot == previous:
+            return
+        # Routes are replaced rather than edited in place. Only the locations
+        # of history penalties affect the overlay.
+        self._routing_congestion_snapshot = (router.routes.copy(), set(router.history),
+                                             router.max_half_width)
+        self._routing_congestion_last_paint = now
+
+        tile_cells = max(4, math.ceil(max(router.cols, router.rows) / 160))
+        nets, history, conflicts = router.preview_congestion(tile_cells)
+        levels = {cell: int(count > 1) for cell, count in nets.items()}
+        levels.update(dict.fromkeys(history, 2))
+        levels.update(dict.fromkeys(conflicts, 3))
+        paths = [QPainterPath() for _ in CONGESTION_COLORS]
+        step = router.step
+        for (tile_x, tile_y), level in levels.items():
+            col, row = tile_x * tile_cells, tile_y * tile_cells
+            x, y = router._point((col, row))
+            width = min(tile_cells, router.cols - col) * step
+            height = min(tile_cells, router.rows - row) * step
+            paths[level].addRect(QRectF(x - step / 2, -y + step / 2 - height, width, height))
+        if not self._routing_congestion_items:
+            scene = self.view.scene()
+            for _, rgb, opacity in CONGESTION_COLORS:
+                color = QColor(rgb)
+                color.setAlpha(opacity)
+                item = scene.addPath(QPainterPath(), QPen(Qt.PenStyle.NoPen), QBrush(color))
+                item.setZValue(1)
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self._routing_congestion_items.append(item)
+        for item, path in zip(self._routing_congestion_items, paths):
+            item.setPath(path)
+
     def _draw_routing_preview(self, router, round_number, total_rounds, message):
         """Incrementally paint actual provisional grid routes on the open board."""
         if self.document is not self._routing_preview_document:
@@ -665,6 +752,7 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         changed_round = round_number != self._routing_preview_round
         if changed_round:
+            self._clear_routing_congestion()
             for _, item, _ in self._routing_preview_items.values():
                 self.view.scene().removeItem(item)
             self._routing_preview_items.clear()
@@ -672,6 +760,7 @@ class MainWindow(QMainWindow):
                 self.view.scene().removeItem(item)
             self._routing_preview_airwires.clear()
             self._routing_preview_round = round_number
+        self._draw_routing_congestion(router, now)
         if (not changed_round and message != 'Routing complete' and
                 set(router.routes) == set(self._routing_preview_items) and
                 now - self._routing_preview_last_paint < 0.15):
@@ -951,6 +1040,29 @@ class MainWindow(QMainWindow):
         attraction_strength.setValue(RouterConfig().attraction_strength)
         attraction_row.addWidget(attraction_strength)
         layout.addLayout(attraction_row)
+        repulsion_row = QHBoxLayout()
+        repulsion_label = QLabel('Repulsion strength (0 disables)')
+        repulsion_strength = QDoubleSpinBox()
+        repulsion_strength.setObjectName('repulsion_strength')
+        repulsion_strength.setRange(0.0, 4.0)
+        repulsion_strength.setDecimals(2)
+        repulsion_strength.setSingleStep(0.25)
+        repulsion_strength.setValue(RouterConfig().repulsion_strength)
+        repulsion_strength.setToolTip('Applies to the Repulsion block in the selected pipeline.')
+        repulsion_label.setBuddy(repulsion_strength)
+        repulsion_row.addWidget(repulsion_label)
+        repulsion_row.addWidget(repulsion_strength)
+        layout.addLayout(repulsion_row)
+
+        def update_repulsion_control():
+            pipeline = pipeline_choice.currentData()
+            enabled = algorithm.currentIndex() == 0 and pipeline is not None and 'repulsion' in pipeline.blocks
+            repulsion_label.setEnabled(enabled)
+            repulsion_strength.setEnabled(enabled)
+
+        algorithm.currentIndexChanged.connect(update_repulsion_control)
+        pipeline_choice.currentIndexChanged.connect(update_repulsion_control)
+        update_repulsion_control()
         detour_row = QHBoxLayout()
         detour_label = QLabel('Maximum route stretch (0 disables)')
         detour_row.addWidget(detour_label)
@@ -1030,6 +1142,7 @@ class MainWindow(QMainWindow):
                               detailed_max_passes=detail_passes.value(),
                               detailed_drag_states=drag_states.value(),
                               attraction_strength=attraction_strength.value(),
+                              repulsion_strength=repulsion_strength.value(),
                               max_detour_ratio=max_detour_ratio.value(),
                               random_rounds=random_rounds.value(),
                               random_seed=random_seed.value(),
@@ -1044,7 +1157,8 @@ class MainWindow(QMainWindow):
         previous_mode = self.mode.currentText()
         self.mode.setCurrentText('Select')
         action_states = [(action, action.isEnabled())
-                         for action in [*self.main_toolbar.actions(), self.pipeline_action]]
+                         for action in [*self.main_toolbar.actions(), self.pipeline_action]
+                         if action is not self.congestion_action]
         for action, _ in action_states:
             action.setEnabled(False)
         self.mode.setEnabled(False)
@@ -1172,6 +1286,9 @@ class MainWindow(QMainWindow):
                        f'\nBoard force compaction: {report.force_iterations_run} iterations, '
                        f'{report.force_jobs_moved} moved traces (including existing board copper), '
                        f'{report.force_new_connections:+d} net connection change.')
+            if 'repulsion' in blocks:
+                detail += (f'\nRepulsion ran {report.repulsion_passes} passes with '
+                           f'{report.repulsion_traces_moved} traces moved.')
             detail += (f'\nDetailed routing: {report.detailed_passes} passes, '
                        f'{report.detailed_straightened} straightened traces, '
                        f'{report.detailed_dragged} connections made by dragging blockers, '

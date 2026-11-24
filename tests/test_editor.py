@@ -227,6 +227,56 @@ def test_live_routing_preview_paints_and_rolls_back_without_edit(qt_app):
     w.close()
 
 
+def test_live_congestion_colors_follow_grid_and_reset_between_rounds(qt_app):
+    from PySide6.QtCore import QPointF
+    from pcb_viewer.app import CONGESTION_COLORS, MainWindow
+    from pcb_viewer.router import Autorouter, RouterConfig
+
+    window = MainWindow()
+    board = window.document.data
+    board['metadata'] = {'routing_bounds': [0, 64, 0, 36]}
+    board['routing_connections'] = [
+        {'net': net, 'layer': 'TOP', 'width': 1, 'start': [left, y], 'end': [right, y]}
+        for net, left, right, y in [('A', 4, 28, 4), ('B', 4, 28, 7),
+                                    ('C', 36, 60, 8), ('D', 36, 60, 9),
+                                    ('E', 4, 28, 24), ('E', 4, 24, 24)]
+    ]
+    original = copy.deepcopy(board)
+    router = Autorouter(board, RouterConfig(grid_step=1, clearance=2))
+    for job in router.jobs:
+        router._commit(job, router._grid_line(router._cell(job.start), router._cell(job.goal)))
+    router.history[router._key(router._cell((40, 20)))] = 2
+    router.history[router._key(router._cell((40, 9)))] = 1
+    stencil_cache = router._offset_cache.copy(), router._offsets_by_radius.copy()
+
+    window._begin_routing_preview()
+    window._draw_routing_preview(router, 1, 2, 'Repair')
+    items = window._routing_congestion_items
+    for item, (_, color, _), (x, y) in zip(
+            items, CONGESTION_COLORS, [(12, 24), (12, 5), (40, 20), (40, 9)], strict=True):
+        assert item.path().contains(QPointF(x, -y))
+        assert item.brush().color().name() == color
+    assert (router._offset_cache, router._offsets_by_radius) == stencil_cache
+    assert not window.congestion_legend.isHidden()
+    router.history.clear()
+    window._draw_routing_congestion(router, window._routing_congestion_last_paint)
+    assert items[2].path().isEmpty()
+    assert items[3].path().contains(QPointF(40, -9))
+    window.congestion_action.trigger()
+    assert window.congestion_legend.isHidden()
+    assert all(not item.isVisible() for item in items)
+    window.congestion_action.trigger()
+    assert all(item.isVisible() for item in items)
+
+    next_round = Autorouter(board, RouterConfig(grid_step=1, clearance=2))
+    window._draw_routing_preview(next_round, 2, 2, 'Initial routing')
+    assert not window._routing_congestion_items
+    window._end_routing_preview()
+    assert not window.congestion_action.isVisible() and window.congestion_legend.isHidden()
+    assert window.document.data == original and not window.document.dirty
+    window.close()
+
+
 def test_gui_autoroute_displays_live_preview_before_final_commit(qt_app, monkeypatch):
     from PySide6.QtWidgets import QDialog, QMessageBox, QSpinBox
     from pcb_viewer.app import MainWindow
@@ -256,15 +306,18 @@ def test_gui_autoroute_displays_live_preview_before_final_commit(qt_app, monkeyp
         assert w._route_progress_bar.parentWidget() is w.statusBar()
         assert w._routing_in_progress and w.view.isEnabled()
         assert not w.mode.isEnabled() and not w.tabs.isEnabled()
+        assert w.congestion_action.isEnabled()
         original_draw(router, round_number, total_rounds, message)
         snapshots.append((len(router.routes), len(w.document.data.get('wires', [])),
-                          len(w._routing_preview_items)))
+                          len(w._routing_preview_items),
+                          any(not item.path().isEmpty() for item in w._routing_congestion_items)))
 
     monkeypatch.setattr(w, '_draw_routing_preview', observe)
     w.autoroute()
-    assert any(routed > 0 and committed == 0 and painted > 0
-               for routed, committed, painted in snapshots)
+    assert any(routed > 0 and committed == 0 and painted > 0 and congestion
+               for routed, committed, painted, congestion in snapshots)
     assert not w._routing_preview_items and not w._routing_preview_airwires
+    assert not w._routing_congestion_items
     assert w._route_progress_bar is None
     assert not w._routing_in_progress
     assert w.mode.isEnabled() and w.tabs.isEnabled() and w.side_dock.isEnabled()
@@ -299,6 +352,7 @@ def test_cancelled_gui_autoroute_restores_existing_copper(qt_app, monkeypatch):
     assert not w.document.dirty
     assert old_item.isVisible()
     assert not w._routing_preview_items
+    assert not w._routing_congestion_items
     assert w._route_cancel_button is None
     assert not w._routing_in_progress
     assert w.mode.isEnabled() and w.tabs.isEnabled() and w.side_dock.isEnabled()
@@ -482,6 +536,8 @@ def test_pipeline_page_saves_reloads_and_runs_dragged_blocks(qt_app, tmp_path, m
     editor.blocks.setCurrentRow(0)
     editor.move_block(1)
     assert editor.block_ids() == ('place_ripup', 'missing_route_swaps')
+    drop_block('clear_congestion', editor.blocks.viewport().rect().center())
+    assert editor.block_ids() == ('place_ripup', 'missing_route_swaps', 'clear_congestion')
     assert editor.save()
 
     assert RoutingPipeline.load(library_dir / 'pipeline-swaps-placement.json') == editor.draft()

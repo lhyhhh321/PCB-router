@@ -46,6 +46,33 @@ def test_pipeline_order_and_repeated_blocks_change_routing(board, monkeypatch):
     assert removed.routed == 0 and kept.routed == 3
 
 
+@pytest.mark.parametrize('strict_final', [False, True])
+def test_clear_congestion_resets_repair_history_at_its_position(board, strict_final):
+    board['routing_connections'][1].update(start=[0, 2], end=[20, 2])
+    blocks = ('repair', 'clear_congestion', 'initial')
+    router = Autorouter(board, RouterConfig(
+        grid_step=2, clearance=2, boundary_margin=10, iterations=2, strict_final=strict_final,
+        pipeline=RoutingPipeline('Reset between blocks', blocks)))
+    for job in router.jobs[:2]:
+        router._commit(job, router._grid_line(router._cell(job.start), router._cell(job.goal)))
+    histories = {}
+
+    def observe(active, _done, _total, message):
+        if message.startswith('Repair'):
+            histories['repair'] = dict(active.history)
+        elif message == 'Clear congestion info':
+            histories['clear'] = dict(active.history)
+        elif message.startswith('Initial routing'):
+            histories['initial'] = dict(active.history)
+
+    _, report = router.route(preview=observe)
+    assert histories['repair']
+    assert histories['clear'] == histories['initial'] == {}
+    assert [row['stage'] for row in report.stage_results] == list(blocks)
+    reset = report.stage_results[1]
+    assert reset['before'] == reset['after']
+
+
 def test_place_ripup_repairs_blocked_connection_before_placing_next_job():
     board = {'layer': 'TOP', 'routing_connections': [
         {'net': net, 'layer': 'TOP', 'width': 1, 'start': start, 'end': end}
@@ -175,7 +202,7 @@ def test_pipeline_cli_loads_ordered_definition(board, tmp_path, monkeypatch):
     source = tmp_path / 'board.json'
     output = tmp_path / 'result.json'
     pipeline_file = tmp_path / 'pipeline.json'
-    pipeline = RoutingPipeline('Crossings first', ('crossing_cleanup', 'initial'))
+    pipeline = RoutingPipeline('Crossings first', ('crossing_cleanup', 'clear_congestion', 'initial'))
     source.write_text(json.dumps(board))
     pipeline_file.write_text(json.dumps(pipeline.to_dict()))
     monkeypatch.setattr(sys, 'argv', ['pcb_viewer', str(source), '--autoroute',
