@@ -408,8 +408,8 @@ def test_auto_route_sidebar_tracks_tabs_and_undo(qt_app):
     w.close()
 
 
-def test_gui_stage_selection_reaches_router(qt_app, monkeypatch):
-    from PySide6.QtWidgets import QDialog, QMessageBox, QPushButton
+def test_gui_stage_and_routing_priority_selections_reach_router(qt_app, monkeypatch):
+    from PySide6.QtWidgets import QComboBox, QDialog, QMessageBox, QPushButton
     from pcb_viewer.app import MainWindow, RoutingStagesDialog
     w = MainWindow()
     w.document.data['routing_connections'] = [
@@ -423,6 +423,7 @@ def test_gui_stage_selection_reaches_router(qt_app, monkeypatch):
             for stage, checkbox in dialog.checks.items():
                 checkbox.setChecked(stage == 'initial')
         else:
+            dialog.findChild(QComboBox, 'routing_priority').setCurrentText('Nearest routing')
             dialog.findChild(QPushButton, 'routing_stages').click()
         return 1
 
@@ -433,6 +434,8 @@ def test_gui_stage_selection_reaches_router(qt_app, monkeypatch):
     w.autoroute()
     report = w.sessions[w.current_session]['benchmarks']['Built-in']
     assert report.config['enabled_stages'] == ['initial']
+    assert report.config['ordering'] == 'nearest'
+    assert report.config['unrouted_pin_cost'] == 4.0
     assert [row['stage'] for row in report.stage_results] == ['initial']
     assert report.routed == 1
     w.close()
@@ -446,11 +449,10 @@ def test_pipeline_page_saves_reloads_and_runs_dragged_blocks(qt_app, tmp_path, m
     from pcb_viewer.pipeline_editor import BLOCK_ROLE, PipelineEditor
     from pcb_viewer.pipelines import PIPELINE_1, RoutingPipeline
 
-    settings_path = str(tmp_path / 'library.ini')
-    def settings():
-        return QSettings(settings_path, QSettings.Format.IniFormat)
-
-    monkeypatch.setattr(studio, 'PipelineEditor', lambda: PipelineEditor(settings=settings()))
+    library_dir = tmp_path / 'pipelines'
+    settings = QSettings(str(tmp_path / 'library.ini'), QSettings.Format.IniFormat)
+    monkeypatch.setattr(studio, 'PipelineEditor',
+                        lambda: PipelineEditor(settings=settings, library_dir=library_dir))
     window = studio.MainWindow()
     window.show()
     assert window.pages.currentWidget() == window.view
@@ -482,7 +484,9 @@ def test_pipeline_page_saves_reloads_and_runs_dragged_blocks(qt_app, tmp_path, m
     assert editor.block_ids() == ('place_ripup', 'missing_route_swaps')
     assert editor.save()
 
-    fresh = PipelineEditor(settings=settings())
+    assert RoutingPipeline.load(library_dir / 'pipeline-swaps-placement.json') == editor.draft()
+    fresh_settings = QSettings(str(tmp_path / 'fresh.ini'), QSettings.Format.IniFormat)
+    fresh = PipelineEditor(settings=fresh_settings, library_dir=library_dir)
     fresh.saved_list.setCurrentText(editor.name.text())
     fresh.load_saved()
     assert fresh.draft() == editor.draft()
@@ -514,6 +518,39 @@ def test_pipeline_page_saves_reloads_and_runs_dragged_blocks(qt_app, tmp_path, m
     window.close()
 
 
+def test_legacy_pipelines_migrate_once_and_preserve_project_versions(qt_app, tmp_path):
+    from PySide6.QtCore import QSettings
+    from pcb_viewer.pipeline_editor import LEGACY_GROUP, PipelineEditor
+    from pcb_viewer.pipelines import RoutingPipeline
+
+    settings = QSettings(str(tmp_path / 'legacy.ini'), QSettings.Format.IniFormat)
+    library = tmp_path / 'pipelines'
+    library.mkdir()
+    project = RoutingPipeline('Pipeline 2', ('initial',))
+    project_file = library / 'pipeline-2.json'
+    project_file.write_text(json.dumps(project.to_dict()), encoding='utf-8')
+    local = RoutingPipeline('Pipeline 2', ('place_ripup', 'repair', 'place_ripup'))
+    standalone = RoutingPipeline('Fan-out', ('initial', 'repair'))
+    for key, pipeline in [('pipeline%202', local), ('fan-out', standalone)]:
+        settings.setValue(f'{LEGACY_GROUP}/{key}', json.dumps(pipeline.to_dict()))
+    settings.sync()
+
+    editor = PipelineEditor(settings=settings, library_dir=library)
+    copies = {pipeline.name: pipeline for pipeline in editor.pipelines()}
+    assert copies['Pipeline 2'] == project
+    assert copies['Pipeline 2 (local)'].blocks == local.blocks
+    assert copies['Fan-out'] == standalone
+    assert len(list(library.glob('*.json'))) == 3
+
+    updated = RoutingPipeline('Pipeline 2', ('initial', 'early_refinement'))
+    project_file.write_text(json.dumps(updated.to_dict()), encoding='utf-8')
+    editor.refresh_library()
+    assert updated in editor.pipelines()
+    assert PipelineEditor(settings=settings, library_dir=library).pipelines() == editor.pipelines()
+    assert len(list(library.glob('*.json'))) == 3
+    assert settings.contains(f'{LEGACY_GROUP}/pipeline%202')
+
+
 def test_drag_back_to_palette_removes_only_dragged_occurrence(qt_app, tmp_path, monkeypatch):
     from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
     from PySide6.QtGui import QDrag, QDragEnterEvent, QDragMoveEvent, QDropEvent
@@ -522,7 +559,7 @@ def test_drag_back_to_palette_removes_only_dragged_occurrence(qt_app, tmp_path, 
     from pcb_viewer.pipelines import PIPELINE_1
 
     settings = QSettings(str(tmp_path / 'library.ini'), QSettings.Format.IniFormat)
-    editor = PipelineEditor(settings=settings)
+    editor = PipelineEditor(settings=settings, library_dir=tmp_path / 'pipelines')
     editor.resize(900, 630)
     editor.show()
     qt_app.processEvents()

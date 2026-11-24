@@ -49,11 +49,11 @@ def test_keepouts_do_not_attract_even_with_net_field():
     assert all(y == 0 for _, y in points)
 
 
-def test_stronger_default_and_missing_corridor_protection():
+def test_disabled_default_and_missing_corridor_protection():
     objects = [{'net': 'FIXED_ONLY', 'layer': 'TOP', 'width': 1, 'points': [[0, 8], [20, 8]]}]
-    assert RouterConfig().attraction_strength == 1.0
+    assert RouterConfig().attraction_strength == 0.0
     weak, _, _ = guide('wires', objects, strength=0.5)
-    strong, _, _ = guide('wires', objects)
+    strong, _, _ = guide('wires', objects, strength=1.0)
     assert max(y for _, y in strong) == pytest.approx(2 * max(y for _, y in weak))
     assert guide('wires', objects, missing=True)[0] == guide('wires', objects, strength=0, missing=True)[0]
 

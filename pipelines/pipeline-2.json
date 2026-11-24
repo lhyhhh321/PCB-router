@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "Pipeline 2",
+  "blocks": [
+    "place_ripup",
+    "early_refinement",
+    "repair",
+    "legalization",
+    "missing_route_swaps",
+    "combined",
+    "detour_guard",
+    "detailed_straighten",
+    "detailed_astar",
+    "detailed_drag",
+    "detour_guard",
+    "crossing_cleanup"
+  ]
+}

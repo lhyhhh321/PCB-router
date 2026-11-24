@@ -29,6 +29,51 @@ def test_routes_around_wire_keepout():
     assert report.wire_length > math.sqrt(800)
 
 
+def test_pin_penalty_fades_with_distance_and_tracks_shared_pin_connection():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': net, 'layer': 'TOP', 'width': 0.4, 'start': start, 'end': end}
+        for net, start, end in (
+            ('A', [0, 0], [32, 0]),
+            ('B', [16, 1], [16, 22]),
+            ('B', [16, 1], [33, 20]),
+        )
+    ]}
+    router = Autorouter(board, RouterConfig(grid_step=1, clearance=0, boundary_margin=10))
+    target, first_branch, _ = router.jobs
+
+    def penalty(point, job=target):
+        return router._unrouted_pin_penalty(router._cell(point), job)
+
+    assert penalty((16, 1)) == 4.0
+    assert penalty((16, 2)) > penalty((16, 4)) > penalty((16, 8)) > penalty((2, 1)) == 0
+    assert penalty((16, 1), first_branch) == 0
+    branch = router._grid_line(router._cell(first_branch.start), router._cell(first_branch.goal))
+    router._commit(first_branch, branch)
+    assert penalty((16, 1)) == 0
+    assert penalty((33, 20)) > 0
+    router._remove(first_branch.id)
+    assert penalty((16, 1)) > 0
+
+
+def test_placement_uses_astar_to_leave_room_near_a_pending_pin():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': 'A', 'layer': 'TOP', 'width': 0.4, 'start': [0, 0], 'end': [32, 0]},
+        {'net': 'B', 'layer': 'TOP', 'width': 0.4, 'start': [16, 1], 'end': [16, 22]},
+    ]}
+    router = Autorouter(board, RouterConfig(grid_step=1, clearance=0, boundary_margin=10))
+    target, pending = router.jobs
+    start, goal = router._cell(target.start), router._cell(target.goal)
+    direct = router._grid_line(start, goal)
+    path = router._route_job(target, 0, True)
+    assert path is not None and path != direct
+    assert min(math.dist(router._point(cell), pending.start) for cell in path) > 4
+    assert not router._path_blockers(target, path)
+    # The penalty still allows a legal path through the region when space is tight.
+    assert router._astar(target, (start[0], goal[0], start[1], goal[1]), 0, True) == direct
+    router._commit(pending, router._grid_line(router._cell(pending.start), router._cell(pending.goal)))
+    assert router._route_job(target, 0, True) == direct
+
+
 def test_live_preview_callback_reports_actual_route_snapshots():
     board = {'layer': 'TOP', 'routing_connections': [
         {'net': 'A', 'layer': 'TOP', 'width': 1,
@@ -68,6 +113,26 @@ def test_seeded_initial_order_is_reproducible_and_changes_sequence():
     assert order(7) == order(7)
     assert order(7) != order(None)
     assert order(7) != order(8)
+
+
+def test_nearest_order_starts_longest_and_follows_last_connection():
+    board = {'layer': 'TOP', 'routing_connections': [
+        {'net': name, 'layer': 'TOP', 'width': 1, 'start': start, 'end': end}
+        for name, start, end in (
+            ('near_first', [0, 4], [4, 4]),
+            ('near_end', [101, 0], [121, 0]),
+            ('longest', [0, 0], [100, 0]),
+            ('near_previous', [124, 0], [161, 0]),
+        )
+    ]}
+    config = RouterConfig(ordering='nearest', boundary_margin=10)
+    for seed in (None, 7):
+        router = Autorouter(board, config, order_seed=seed)
+        assert [job.id for job in router._initial_order()] == [2, 1, 3, 0]
+
+        longest = router.jobs[2]
+        router._commit(longest, router._grid_line(router._cell(longest.start), router._cell(longest.goal)))
+        assert [job.id for job in router._initial_order()] == [3, 1, 0]
 
 
 def test_random_order_trials_select_best_cleaner_and_shorter_run(monkeypatch):

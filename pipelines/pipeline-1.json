@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "Pipeline 1",
+  "blocks": [
+    "initial",
+    "early_refinement",
+    "repair",
+    "legalization",
+    "missing_route_swaps",
+    "combined",
+    "detour_guard",
+    "detailed_straighten",
+    "detailed_astar",
+    "detailed_drag",
+    "detour_guard",
+    "crossing_cleanup"
+  ]
+}

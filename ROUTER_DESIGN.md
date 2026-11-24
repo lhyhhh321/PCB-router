@@ -87,7 +87,9 @@ Preferred inputs provide an explicit connection list:
 
 Geometry is read from `pads`, `pins`, `vias`, `wires`, `copper_polygons`, and `keepouts`. Clearance defaults to `metadata.design_rules.clearance_mil`. Missing via/pad shapes use the same fallback radii as the viewer.
 
-The app, CLI, and `RouterConfig` default to one deterministic trial. Increasing the count adds seeded permutations. For a randomized trial, each job's rank in the selected heuristic order receives uniform jitter in a window of 5% of all requests (at least two places), so priority is perturbed locally instead of discarded. Seeds are deterministic and recorded in `round_results`. Every trial creates a fresh router from the same input board. Trial selection prefers fewer final conflict locations, more connected requests, and finally less emitted copper; exact ties preserve the baseline. A fully routed, conflict-free board stops early. `elapsed_seconds` includes all attempted trials, while each trial's own elapsed time remains in `round_results`.
+Nearest routing starts with the remaining connection whose terminals are farthest apart. Each next connection minimizes the Euclidean distance between any of its terminals and either terminal of the previous choice. The baseline resolves ties by wider trace and then connection ID. Already routed connections are excluded from this order.
+
+The app, CLI, and `RouterConfig` default to one deterministic trial. Later trials add seeded rank jitter for density-first and short-route-first in a window of 5% of all requests (at least two places). Nearest routing uses the seed for equal-distance ties. Every trial creates a fresh router from the same input board. Trial selection prefers fewer final conflict locations, more connected requests, and finally less emitted copper. Exact ties preserve the baseline. A fully routed, conflict-free board stops early. `elapsed_seconds` includes all attempted trials, and `round_results` records each trial's seed and elapsed time.
 
 ## Search model
 
@@ -98,9 +100,12 @@ movement + bend_penalty
          + present_factor * conflicting_routes
          + history_factor * prior_violation_count
          + optional_guide_factor * distance_from_explicit_guide
+         + unrouted_pin_cost * max(0, 1 - distance_to_nearest_pending_pin / radius)^2
 ```
 
-Initial patterns and maze searches treat fixed geometry and existing foreign-net routes as hard constraints. They check grid occupancy, opposing diagonal steps, and physical trace intersections, including those involving off-grid terminal segments. An initial job with no legal path stays unrouted. Later soft searches can probe corridors through movable copper with a default present congestion cost of 8 per conflicting route. Missing-route swap probes use that base cost, and all replacement routes must pass hard avoidance. When a resumed board contains raster violations, each congestion-repair pass increases the present cost, increments history around violations, and retains the lowest-conflict solution seen. For up to two stalled jobs per pass, it tests a force-displaced guide and keeps the guided candidate only when its blocker count or tied length improves within a bounded stretch. Hard-avoidance searches omit historical congestion cost.
+The pin term uses the nearest pending terminal on another net. Its radius is the board clearance plus the largest trace half-width plus twelve grid steps. The default peak cost is 4 in A* step units, and `RouterConfig(unrouted_pin_cost=0)` disables the term. The search uses the terminal's actual coordinates. A terminal shared by several requests stops contributing as soon as any of those requests is routed. A legal pattern through a pin penalty region triggers an A* search and remains available if the search fails.
+
+Initial patterns and maze searches treat fixed geometry and existing foreign-net routes as hard constraints. They check grid occupancy, opposing diagonal steps, and physical trace intersections, including those involving off-grid terminal segments. An initial job with no legal path stays unrouted. The soft blocker probes and both rip-up blocks use a shared base present congestion cost of 8 per conflicting route. When a resumed board contains raster violations, each congestion-repair pass increases the present cost, increments history around violations, and retains the lowest-conflict solution seen. For up to two stalled jobs per pass, it tests a force-displaced guide and keeps the guided candidate only when its blocker count or tied length improves within a bounded stretch. Hard-avoidance searches omit historical congestion cost.
 
 Output polylines retain exact source/target coordinates, collapse collinear grid points, and are tagged with `route_type: "autoroute"` and `autoroute_job`. When two same-net requests share a grid edge, that copper is emitted once. Output may therefore contain several fragments for one request, or no new fragment when its entire path is already conductive. `autoroute_jobs` on a shared fragment records all covered request IDs; `report.routed` counts connected requests rather than wire records.
 
@@ -189,7 +194,9 @@ possible future work, but is separate from this tensor backend.
 ## Pipeline configuration and measurements
 
 `RoutingPipeline` stores a name and an ordered tuple of block IDs, including
-repeats. An exported file contains `version`, `name`, and `blocks`.
+repeats. The app saves each definition as a separate JSON file in `pipelines/`
+at the project root. Project files and exports both contain `version`, `name`,
+and `blocks` and can be passed to `--pipeline`.
 `RouterConfig.pipeline` accepts a pipeline directly. When omitted, the router
 uses Pipeline 1. Legacy `RouterConfig.stages` and `--stages` options filter
 Pipeline 1 in its original order. Filtering out initial placement also skips

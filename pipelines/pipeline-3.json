@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "Pipeline 3",
+  "blocks": [
+    "place_ripup",
+    "detailed_straighten",
+    "legalization",
+    "place_ripup",
+    "detailed_straighten",
+    "legalization",
+    "missing_route_swaps",
+    "combined",
+    "detailed_straighten",
+    "crossing_cleanup"
+  ]
+}

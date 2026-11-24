@@ -21,6 +21,8 @@ ROUTING_BLOCKS = {
 
 DETAIL_BLOCKS = ("detailed_straighten", "detailed_astar", "detailed_drag")
 PLACEMENT_BLOCKS = ("initial", "place_ripup")
+PROJECT_PIPELINES = Path(__file__).resolve().parent.parent / "pipelines"
+PIPELINE_1_FILE = PROJECT_PIPELINES / "pipeline-1.json"
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,4 @@ class RoutingPipeline:
             index = end
 
 
-PIPELINE_1 = RoutingPipeline("Pipeline 1", (
-    "initial", "early_refinement", "repair", "legalization", "missing_route_swaps",
-    "combined", "detour_guard", *DETAIL_BLOCKS, "detour_guard", "crossing_cleanup",
-))
+PIPELINE_1 = RoutingPipeline.load(PIPELINE_1_FILE)

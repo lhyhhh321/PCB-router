@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsScene, QGraph
 from .model import Document, COLLECTIONS
 from .pipeline_editor import PipelineEditor
 from .pipelines import PIPELINE_1, ROUTING_BLOCKS
-from .router import ROUTING_STAGES, extract_jobs, routing_layer
+from .router import ROUTING_ORDERS, ROUTING_STAGES, extract_jobs, routing_layer
 
 COLORS = ['#58c8ff', '#f6c85f', '#b291ff', '#74dfa5', '#ff8c87', '#7bdad0', '#dbaaed', '#bbc976', '#ee9fce', '#839fff']
 
@@ -373,6 +373,7 @@ class MainWindow(QMainWindow):
         self.tab_strip_action.setVisible(not shown)
         board_widgets = (self.main_toolbar, self.side_dock, self.coords)
         if shown:
+            self.pipeline_editor.refresh_library()
             self._board_widget_visibility = [not widget.isHidden() for widget in board_widgets]
             for widget in board_widgets:
                 widget.hide()
@@ -798,6 +799,7 @@ class MainWindow(QMainWindow):
         pipeline_row.addWidget(pipeline_label)
         pipeline_choice = QComboBox()
         pipeline_choice.setObjectName('routing_pipeline')
+        self.pipeline_editor.refresh_library()
         for pipeline in self.pipeline_editor.pipelines():
             pipeline_choice.addItem(pipeline.name, pipeline)
         pipeline_choice.setCurrentText(self._last_pipeline_name)
@@ -829,9 +831,16 @@ class MainWindow(QMainWindow):
                               for wire in self.document.data.get('wires', [])))
         resume.setToolTip('Load saved generated connections as editable routes and route the missing ones.')
         layout.addWidget(resume)
-        layout.addWidget(QLabel('Built-in routing priority'))
+        priority_label = QLabel('Built-in routing priority')
+        layout.addWidget(priority_label)
         ordering = QComboBox()
-        ordering.addItems(['Higher completion (dense areas first)', 'Faster (short routes first)'])
+        ordering.setObjectName('routing_priority')
+        priority_label.setBuddy(ordering)
+        for value, label in ROUTING_ORDERS.items():
+            ordering.addItem(label, value)
+        ordering.setItemData(ordering.findData('nearest'),
+                             'Start with the longest connection, then choose the closest terminals '
+                             'to the previous connection.', Qt.ItemDataRole.ToolTipRole)
         layout.addWidget(ordering)
         layout.addWidget(QLabel("Congestion calculation"))
         compute_backend = QComboBox()
@@ -939,7 +948,7 @@ class MainWindow(QMainWindow):
         attraction_strength.setRange(0.0, 2.0)
         attraction_strength.setDecimals(2)
         attraction_strength.setSingleStep(0.1)
-        attraction_strength.setValue(1.0)
+        attraction_strength.setValue(RouterConfig().attraction_strength)
         attraction_row.addWidget(attraction_strength)
         layout.addLayout(attraction_row)
         detour_row = QHBoxLayout()
@@ -953,6 +962,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(detour_row)
         algorithm.currentIndexChanged.connect(lambda index: (
             resume.setEnabled(index == 0),
+            priority_label.setEnabled(index == 0),
+            ordering.setEnabled(index == 0),
             compute_backend.setEnabled(index == 0),
             rounds_label.setEnabled(index == 0),
             random_rounds.setEnabled(index == 0),
@@ -1023,7 +1034,7 @@ class MainWindow(QMainWindow):
                               random_rounds=random_rounds.value(),
                               random_seed=random_seed.value(),
                               compute_backend=compute_backend.currentData(),
-                              ordering='dense_first' if ordering.currentIndex() == 0 else 'short',
+                              ordering=ordering.currentData(),
                               layer=selected_layer)
         if use_freerouting:
             QSettings('PCB Studio', 'PCB Studio').setValue('freerouting_jar', jar_field.text())

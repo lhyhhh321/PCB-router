@@ -1,18 +1,29 @@
-"""Desktop editor and local library for routing pipelines."""
+"""Desktop editor for the project's routing pipelines."""
+from contextlib import contextmanager
 import json
-from urllib.parse import quote
+from pathlib import Path
+import re
 
-from PySide6.QtCore import QIODevice, QPersistentModelIndex, QSaveFile, QSettings, Qt
+from PySide6.QtCore import QIODevice, QLockFile, QPersistentModelIndex, QSaveFile, QSettings, Qt
 from PySide6.QtGui import QCursor, QDrag
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
     QVBoxLayout, QWidget)
 
-from .pipelines import PIPELINE_1, ROUTING_BLOCKS, RoutingPipeline
+from .pipelines import PIPELINE_1, PIPELINE_1_FILE, PROJECT_PIPELINES, ROUTING_BLOCKS, RoutingPipeline
 
 
 BLOCK_ROLE = Qt.ItemDataRole.UserRole
-SETTINGS_GROUP = 'routing/pipelines'
+LEGACY_GROUP = 'routing/pipelines'
+MIGRATED_GROUP = 'routing/migrated-pipelines'
+
+
+def write_pipeline(path, pipeline):
+    data = (json.dumps(pipeline.to_dict(), ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    target = QSaveFile(str(path))
+    if (not target.open(QIODevice.OpenModeFlag.WriteOnly) or
+            target.write(data) != len(data) or not target.commit()):
+        raise OSError(f'{Path(path).name} could not be saved. {target.errorString()}')
 
 
 class PipelineBlocks(QListWidget):
@@ -80,10 +91,11 @@ class BlockPalette(QListWidget):
 
 
 class PipelineEditor(QWidget):
-    def __init__(self, parent=None, settings=None):
+    def __init__(self, parent=None, settings=None, library_dir=PROJECT_PIPELINES):
         super().__init__(parent)
-        self.settings = settings if settings is not None else QSettings('PCB Studio', 'PCB Studio')
-        self.saved, settings_error = self._read_library()
+        self.library_dir = Path(library_dir)
+        settings = settings if settings is not None else QSettings('PCB Studio', 'PCB Studio')
+        self.saved, errors = self._migrate_legacy_library(settings)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -151,8 +163,8 @@ class PipelineEditor(QWidget):
             signal.connect(self.update_status)
         self.baseline = None
         self._load_draft(PIPELINE_1, saved=True)
-        if settings_error:
-            self.status.setText(f'Could not read saved pipelines. {settings_error}')
+        if errors:
+            self.status.setText(' '.join(errors))
 
     @staticmethod
     def _button(layout, text, callback):
@@ -173,23 +185,84 @@ class PipelineEditor(QWidget):
         return tuple(self.blocks.item(row).data(BLOCK_ROLE) for row in range(self.blocks.count()))
 
     def _read_library(self):
-        saved = {PIPELINE_1.name.casefold(): PIPELINE_1}
-        settings_error = None
-        self.settings.sync()
-        self.settings.beginGroup(SETTINGS_GROUP)
+        saved = {PIPELINE_1.name.casefold(): (PIPELINE_1, PIPELINE_1_FILE)}
+        errors = []
+        for path in sorted(self.library_dir.glob('*.json')):
+            try:
+                pipeline = RoutingPipeline.load(path)
+                key = pipeline.name.casefold()
+                if key in saved and saved[key][0] != pipeline:
+                    raise ValueError(f'The name {pipeline.name!r} already belongs to another pipeline.')
+                saved.setdefault(key, (pipeline, path))
+            except (OSError, ValueError) as error:
+                errors.append(f'Could not load {path.name}. {error}')
+        return saved, errors
+
+    @contextmanager
+    def _lock_library(self):
+        self.library_dir.mkdir(parents=True, exist_ok=True)
+        lock = QLockFile(str(self.library_dir / '.library.lock'))
+        if not lock.tryLock(1000):
+            raise OSError('Could not lock the project pipeline folder for saving.')
         try:
-            for key in self.settings.childKeys():
-                try:
-                    pipeline = RoutingPipeline.from_dict(json.loads(self.settings.value(key)))
-                    saved.setdefault(pipeline.name.casefold(), pipeline)
-                except (TypeError, ValueError) as error:
-                    settings_error = str(error)
+            yield
         finally:
-            self.settings.endGroup()
-        return saved, settings_error
+            lock.unlock()
+
+    def _new_pipeline_path(self, name):
+        slug = re.sub(r'[^a-z0-9]+', '-', name.casefold()).strip('-')
+        stem = slug.removeprefix('pipeline-')[:72].rstrip('-') or 'custom'
+        base = f'pipeline-{stem}'
+        path = self.library_dir / f'{base}.json'
+        suffix = 2
+        while path.exists() or path.is_symlink():
+            path = self.library_dir / f'{base}-{suffix}.json'
+            suffix += 1
+        return path
+
+    def _migrate_legacy_library(self, settings):
+        saved, errors = self._read_library()
+        settings.sync()
+        settings.beginGroup(LEGACY_GROUP)
+        entries = [(key, settings.value(key)) for key in settings.childKeys()]
+        settings.endGroup()
+        pending = [(key, raw) for key, raw in entries
+                   if settings.value(f'{MIGRATED_GROUP}/{key}') != raw]
+        if not pending:
+            return saved, errors
+        try:
+            with self._lock_library():
+                saved, errors = self._read_library()
+                for key, raw in pending:
+                    try:
+                        pipeline = RoutingPipeline.from_dict(json.loads(raw))
+                        candidate = pipeline
+                        suffix = 1
+                        while (entry := saved.get(candidate.name.casefold())) and entry[0] != candidate:
+                            label = 'local' if suffix == 1 else f'local {suffix}'
+                            candidate = RoutingPipeline(f'{pipeline.name} ({label})', pipeline.blocks)
+                            suffix += 1
+                        if entry is None:
+                            path = self._new_pipeline_path(candidate.name)
+                            write_pipeline(path, candidate)
+                            saved[candidate.name.casefold()] = (candidate, path)
+                        settings.setValue(f'{MIGRATED_GROUP}/{key}', raw)
+                    except (OSError, TypeError, ValueError) as error:
+                        errors.append(f'Could not migrate saved pipeline {key}. {error}')
+        except OSError as error:
+            errors.append(f'Could not migrate saved pipelines. {error}')
+        settings.sync()
+        return saved, errors
 
     def pipelines(self):
-        return tuple(self.saved.values())
+        return tuple(pipeline for pipeline, _ in self.saved.values())
+
+    def refresh_library(self):
+        selected = self.saved_list.currentText()
+        self.saved, errors = self._read_library()
+        self._refresh_saved(selected)
+        if errors:
+            self.status.setText(' '.join(errors))
 
     def _refresh_saved(self, name):
         self.saved_list.clear()
@@ -212,7 +285,7 @@ class PipelineEditor(QWidget):
     def update_status(self, *_args):
         if not self.has_changes():
             self.status.setText('Built-in pipeline. Duplicate it to save a variation.'
-                                if self.baseline == PIPELINE_1 else 'Saved in your pipeline library.')
+                                if self.baseline == PIPELINE_1 else 'Saved in the project pipelines folder.')
         elif self.name.text().strip().casefold() == PIPELINE_1.name.casefold():
             self.status.setText('Unsaved changes. Enter a new name to save a variation of Pipeline 1.')
         else:
@@ -235,9 +308,14 @@ class PipelineEditor(QWidget):
         return candidate
 
     def load_saved(self):
-        pipeline = self.saved[self.saved_list.currentText().casefold()]
+        name = self.saved_list.currentText()
         if self.allow_discard():
-            self._load_draft(self.saved[pipeline.name.casefold()], saved=True)
+            self.refresh_library()
+            entry = self.saved.get(name.casefold())
+            if entry is not None:
+                self._load_draft(entry[0], saved=True)
+            else:
+                self.status.setText(f'Could not find {name} in the project pipelines folder.')
 
     def new_pipeline(self):
         if self.allow_discard():
@@ -277,19 +355,17 @@ class PipelineEditor(QWidget):
         try:
             pipeline = self.draft()
             key = pipeline.name.casefold()
-            saved, _ = self._read_library()
-            existing = saved.get(key)
-            if existing is not None and (existing == PIPELINE_1 or existing != self.baseline):
-                raise ValueError('This pipeline name is already in use. Choose another name.')
-            self.settings.setValue(f'{SETTINGS_GROUP}/{quote(key, safe="")}',
-                                   json.dumps(pipeline.to_dict(), ensure_ascii=False))
-            self.settings.sync()
-            if self.settings.status() != QSettings.Status.NoError:
-                raise OSError('Could not write the pipeline library.')
+            with self._lock_library():
+                saved, _ = self._read_library()
+                existing = saved.get(key)
+                if existing is not None and (existing[0] == PIPELINE_1 or existing[0] != self.baseline):
+                    raise ValueError('A different version of this name is saved. Choose another name or reload it.')
+                path = existing[1] if existing is not None else self._new_pipeline_path(pipeline.name)
+                write_pipeline(path, pipeline)
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, 'Cannot save pipeline', str(error))
             return False
-        self.saved = {**saved, key: pipeline}
+        self.saved = {**saved, key: (pipeline, path)}
         self._load_draft(pipeline, saved=True)
         return True
 
@@ -316,8 +392,7 @@ class PipelineEditor(QWidget):
             return
         if not filename.lower().endswith('.json'):
             filename += '.json'
-        data = (json.dumps(pipeline.to_dict(), ensure_ascii=False, indent=2) + '\n').encode('utf-8')
-        target = QSaveFile(filename)
-        if (not target.open(QIODevice.OpenModeFlag.WriteOnly) or
-                target.write(data) != len(data) or not target.commit()):
-            QMessageBox.warning(self, 'Cannot export pipeline', target.errorString())
+        try:
+            write_pipeline(filename, pipeline)
+        except OSError as error:
+            QMessageBox.warning(self, 'Cannot export pipeline', str(error))

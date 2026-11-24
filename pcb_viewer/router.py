@@ -39,6 +39,11 @@ LEGACY_BLOCK_STAGES = {
     "missing_route_swaps": "legalization", "crossing_cleanup": "legalization",
     **dict.fromkeys(DETAIL_BLOCKS, "detailed"),
 }
+ROUTING_ORDERS = {
+    "dense_first": "Higher completion (dense areas first)",
+    "short": "Faster (short routes first)",
+    "nearest": "Nearest routing",
+}
 
 
 @dataclass
@@ -66,7 +71,7 @@ class RouterConfig:
     early_refine_interval: int = 192
     force_iterations: int = 6
     force_max_jobs: int = 12
-    attraction_strength: float = 1.0
+    attraction_strength: float = 0.0
     max_detour_ratio: float = 3.0
     detailed_max_passes: int = 32
     detailed_drag_states: int = 12
@@ -74,6 +79,7 @@ class RouterConfig:
     stages: tuple[str, ...] | None = None
     resume: bool = False
     pipeline: RoutingPipeline | None = None
+    unrouted_pin_cost: float = 4.0
 
     def stage_enabled(self, stage: str) -> bool:
         if self.pipeline is not None:
@@ -134,8 +140,8 @@ class RouterConfig:
             raise ValueError("Detailed-routing passes must be between 0 and 64.")
         if not 0 <= self.detailed_drag_states <= 64:
             raise ValueError("Detailed drag search states must be between 0 and 64.")
-        if self.ordering not in ("short", "dense_first"):
-            raise ValueError("Routing order must be short or dense_first.")
+        if not isinstance(self.ordering, str) or self.ordering not in ROUTING_ORDERS:
+            raise ValueError("Routing order must be one of: " + ", ".join(ROUTING_ORDERS))
         if not isinstance(self.random_rounds, int) or not 1 <= self.random_rounds <= 16:
             raise ValueError("Randomized routing rounds must be between 1 and 16.")
         if not isinstance(self.random_seed, int):
@@ -143,7 +149,8 @@ class RouterConfig:
         for label, value in (("bend penalty", self.bend_penalty),
                              ("present congestion cost", self.present_congestion_cost),
                              ("history cost", self.history_cost),
-                             ("guide cost", self.guide_cost)):
+                             ("guide cost", self.guide_cost),
+                             ("unrouted pin cost", self.unrouted_pin_cost)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"Routing {label} cannot be negative.")
 
@@ -421,6 +428,8 @@ class Autorouter:
         self.force_guides: dict[int, tuple[Point, ...]] = {}
         self.jobs_by_id = {job.id: job for job in self.jobs}
         self.max_half_width = max(job.width for job in self.jobs) / 2
+        self._pin_cost_radius = max(0.0, self.clearance) + self.max_half_width + 12 * self.step
+        self._routing_pin_buckets = self._index_routing_pins() if self.config.unrouted_pin_cost else {}
         self.coarse_guides = {
             job.id: self._simplify_guide(job.guide, max(self.step, self.config.guide_margin / 2))
             for job in self.jobs if self.config.use_routing_guides and len(job.guide) >= 2
@@ -718,6 +727,40 @@ class Autorouter:
         conflicts, historical = self._dynamic_context(cell, job)
         return len(conflicts), historical
 
+    def _index_routing_pins(self) -> dict[Cell, list[tuple[str, Point, set[int]]]]:
+        requests: dict[tuple[str, Point], set[int]] = {}
+        for job in self.jobs:
+            for point in (job.start, job.goal):
+                requests.setdefault((job.net, point), set()).add(job.id)
+        radius = self._pin_cost_radius
+        buckets: dict[Cell, list[tuple[str, Point, set[int]]]] = {}
+        for (net, point), job_ids in requests.items():
+            x, y = point
+            bx, by = math.floor(x / radius), math.floor(y / radius)
+            # Register the pin in every bucket its cost radius can reach.
+            for u in range(bx - 1, bx + 2):
+                for v in range(by - 1, by + 2):
+                    buckets.setdefault((u, v), []).append((net, point, job_ids))
+        return buckets
+
+    def _unrouted_pin_penalty(self, cell: Cell, job: RoutingJob) -> float:
+        if not self._routing_pin_buckets:
+            return 0.0
+        x, y = self._point(cell)
+        radius = self._pin_cost_radius
+        bucket = math.floor(x / radius), math.floor(y / radius)
+        nearest_squared = radius * radius
+        for net, (px, py), job_ids in self._routing_pin_buckets.get(bucket, ()):
+            if net == job.net:
+                continue
+            squared = (x - px) ** 2 + (y - py) ** 2
+            if squared < nearest_squared and not any(job_id in self.routes for job_id in job_ids):
+                nearest_squared = squared
+        if nearest_squared >= radius * radius:
+            return 0.0
+        proximity = 1.0 - math.sqrt(nearest_squared) / radius
+        return self.config.unrouted_pin_cost * proximity ** 2
+
     @staticmethod
     def _diagonal_square(a: Cell, b: Cell) -> tuple[Cell, int] | None:
         if abs(a[0] - b[0]) != 1 or abs(a[1] - b[1]) != 1:
@@ -779,7 +822,7 @@ class Autorouter:
         previous: dict[Cell, Cell] = {}
         legal_cache: dict[Cell, bool] = {}
         dynamic_cache: dict[Cell, tuple[int, int]] = {}
-        guide_cache: dict[Cell, float] = {}
+        cell_cost_cache: dict[Cell, float] = {}
         queue = [(self._heuristic(start, goal), next(counter), 0.0, start, -1)]
         expansions = 0
         found = False
@@ -827,11 +870,11 @@ class Autorouter:
                 move = math.sqrt(2) if dx and dy else 1.0
                 bend = self.config.bend_penalty if old_direction >= 0 and old_direction != direction else 0.0
                 dynamic = present_factor * conflicts + weight * historical
-                guide_cost = guide_cache.get(nxt)
-                if guide_cost is None:
-                    guide_cost = self._routing_guide_cost(nxt, job)
-                    guide_cache[nxt] = guide_cost
-                new_cost = cost + move + bend + dynamic + guide_cost
+                cell_cost = cell_cost_cache.get(nxt)
+                if cell_cost is None:
+                    cell_cost = self._routing_guide_cost(nxt, job) + self._unrouted_pin_penalty(nxt, job)
+                    cell_cost_cache[nxt] = cell_cost
+                new_cost = cost + move + bend + dynamic + cell_cost
                 if new_cost + 1e-12 < best.get(nxt, math.inf):
                     a = job.start if cell == start else self._point(cell)
                     b = job.goal if nxt == goal else self._point(nxt)
@@ -953,9 +996,15 @@ class Autorouter:
                     if self.config.use_routing_guides and len(job.guide) >= 2
                     else self._pattern_paths(job))
         avoid_history = not hard_avoidance and self.config.history_cost > 0
+        fallback = None
         for path in patterns:
-            if self._pattern_legal(job, path, avoid_history):
+            if not self._pattern_legal(job, path, avoid_history):
+                continue
+            if not self._routing_pin_buckets or not any(
+                    self._unrouted_pin_penalty(cell, job) for cell in path[1:-1]):
                 return path
+            if fallback is None:
+                fallback = path
         # Increasing guide boxes mimic detailed-route guide relaxation.
         margins = [self.config.guide_margin,
                    max(self.config.guide_margin * 2.5, 100.0),
@@ -970,7 +1019,7 @@ class Autorouter:
             route = self._astar(job, bounds, present_factor, hard_avoidance, **options)
             if route is not None:
                 return route
-        return None
+        return fallback
 
     def _route_reversed(self, job: RoutingJob, present_factor: float,
                         hard_avoidance: bool = True) -> list[Cell] | None:
@@ -2031,8 +2080,31 @@ class Autorouter:
                     crossings.add((min(job_id, other_id), max(job_id, other_id)))
         return crossings
 
+    def _nearest_order(self) -> list[RoutingJob]:
+        remaining = sorted((job for job in self.jobs if job.id not in self.routes),
+                           key=lambda job: (-job.width, job.id))
+        if not remaining:
+            return []
+        if self.order_seed is not None:
+            # Shuffle tie priority without changing the longest-first or nearest rules.
+            random.Random(self.order_seed).shuffle(remaining)
+        first = max(remaining, key=lambda job: math.dist(job.start, job.goal))
+        ordered = [first]
+        remaining.remove(first)
+        while remaining:
+            previous = ordered[-1]
+            nearest = min(remaining, key=lambda job: min(
+                math.dist(a, b) for a in (previous.start, previous.goal)
+                for b in (job.start, job.goal)
+            ))
+            ordered.append(nearest)
+            remaining.remove(nearest)
+        return ordered
+
     def _initial_order(self) -> list[RoutingJob]:
         """Preserve heuristic priority while trying reproducible nearby permutations."""
+        if self.config.ordering == "nearest":
+            return self._nearest_order()
         if self.config.ordering == "dense_first":
             terminals = [(other.net, point) for other in self.jobs
                          for point in (other.start, other.goal)]

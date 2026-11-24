@@ -52,7 +52,9 @@ def test_place_ripup_repairs_blocked_connection_before_placing_next_job():
         for net, start, end in (('A', [0, 0], [20, 0]), ('B', [10, 0], [10, 30]),
                                 ('C', [30, 40], [65, 40]))
     ]}
-    _, separate = autoroute_data(board, config(ordering='short', stages=('initial', 'repair')))
+    # Isolate rip-up by letting the first placement occupy B's terminal region.
+    _, separate = autoroute_data(board, config(ordering='short', stages=('initial', 'repair'),
+                                               unrouted_pin_cost=0))
     messages = []
 
     def crossing_free_preview(router, *_):
@@ -61,7 +63,8 @@ def test_place_ripup_repairs_blocked_connection_before_placing_next_job():
                        for job, path in router.routes.items())
 
     wires, merged = autoroute_data(
-        board, config(ordering='short', pipeline=RoutingPipeline('Adaptive', ('place_ripup',))),
+        board, config(ordering='short', pipeline=RoutingPipeline('Adaptive', ('place_ripup',)),
+                      unrouted_pin_cost=0),
         progress=lambda _done, _total, message: messages.append(message.removeprefix('Round 1/1: ')),
         preview=crossing_free_preview,
     )

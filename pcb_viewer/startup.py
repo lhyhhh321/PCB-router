@@ -43,11 +43,11 @@ def main():
     parser.add_argument('--layer', help='Route the specified signal layer')
     parser.add_argument('--grid', type=float, default=2.0, help='Autorouter grid spacing (default: 2.0)')
     parser.add_argument('--clearance', type=float, help='Override metadata design-rule clearance')
-    from .router import ROUTING_STAGES
+    from .router import ROUTING_ORDERS, ROUTING_STAGES, RouterConfig
     from .pipelines import RoutingPipeline
     pipeline_options = parser.add_mutually_exclusive_group()
     pipeline_options.add_argument('--pipeline', metavar='FILE',
-                                  help='Exported routing pipeline JSON (default: Pipeline 1)')
+                                  help='Saved or exported routing pipeline JSON (default: Pipeline 1)')
     pipeline_options.add_argument('--stages', nargs='*', choices=tuple(ROUTING_STAGES),
                                   help='Filter Pipeline 1 stages in their original order '
                                        '(an empty list runs validation only)')
@@ -66,11 +66,11 @@ def main():
                         help='Detailed straighten/drag passes (0 disables; default: 32)')
     parser.add_argument('--detailed-drag-states', type=int, default=12,
                         help='Bounded segment-slide search states per missed connection (0 disables; default: 12)')
-    parser.add_argument('--attraction-strength', type=float, default=1.0,
-                        help='Board-wide inter-net spacing attraction (0 disables; default: 1.0)')
+    parser.add_argument('--attraction-strength', type=float, default=RouterConfig().attraction_strength,
+                        help='Board-wide inter-net spacing attraction (0 disables it, default %(default)s)')
     parser.add_argument('--max-detour-ratio', type=float, default=3.0,
                         help='Reject extreme route stretch after repair (0 disables; default: 3)')
-    parser.add_argument('--ordering', choices=('dense_first', 'short'), default='dense_first',
+    parser.add_argument('--ordering', choices=tuple(ROUTING_ORDERS), default='dense_first',
                         help='Built-in route priority (default: dense_first)')
     parser.add_argument('--random-rounds', type=int, default=1,
                         help='Built-in order trials including baseline (default: 1; increase for randomized trials)')
@@ -96,7 +96,7 @@ def main():
             return 1
         try:
             from .model import Document
-            from .router import RouterConfig, autoroute_data, routing_layer
+            from .router import autoroute_data, routing_layer
             from .freerouting import freeroute_data
             document = Document.load(args.file)
             layer = routing_layer(document.data, args.layer)

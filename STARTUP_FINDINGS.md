@@ -21,16 +21,19 @@ It exited with status **134 (Qt abort)** and reported that the `xcb` platform pl
 
 The Python entry points now check these conditions before constructing `QApplication` and print actionable diagnostics instead of reaching the Qt abort. `--help` works without Qt initialization, and `--diagnose` checks startup prerequisites. `scripts/run-python.sh` chooses the project virtual environment and uses the locally unpacked XCB libraries when available, without mixing incompatible Qt versions.
 
-A C++17/Qt 6 implementation is in `cpp/`. It has separate `--check` and `--render` modes for headless validation, startup diagnostics, build/run scripts, and documented OS dependencies. C++ still requires Qt runtime libraries and a display for interactive use. It is not a language-level workaround for a missing display server.
-
-Additional source issues found and fixed in both implementations:
+Additional issues fixed in the Python viewer:
 
 - Stale search/drawing state after opening a different document.
 - Acceptance of invalid layer types and malformed inline pad shapes before rendering.
 - All-layer pad rendering used only one layer's shape.
 
-The C++ implementation additionally makes multi-object edits one undo step and makes target keepouts visible upon creation. The full samples include legitimate `net: null` and zero-radius `unknown_padstack` definitions; these are preserved rather than treated as corrupt files.
-
 ## Desktop launch
 
-On Ubuntu/Debian, install the six XCB packages listed in `cpp/README.md` and run from a graphical desktop terminal. In this restricted workspace, dependencies were downloaded and unpacked locally because sudo authentication is unavailable. Use `scripts/run-cpp.sh` or `scripts/run-python.sh` to pick them up. Neither launcher creates a desktop session.
+On Ubuntu/Debian, install the XCB runtime packages and run from a graphical desktop terminal.
+
+```bash
+sudo apt-get install libxcb-cursor0 libxcb-icccm4 libxcb-util1 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
+./scripts/run-python.sh
+```
+
+The Python launcher also picks up the runtime libraries if they are unpacked in `.tools/xcb`.
